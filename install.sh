@@ -31,7 +31,7 @@
 #   HTTPS          加密的网址（https://），需要一个解析到 VPS 的域名
 #======================================================================
 
-VERSION=1.0.0
+VERSION=1.0.1
 # ipaweb-onekey-begin
 
 REPO=imthnio/vps-ipatool
@@ -77,7 +77,7 @@ have()     { command -v "$1" >/dev/null 2>&1; }
 #----------------------------------------------------------------------
 can_ask() {
   [ -z "${IPAWEB_YES:-}" ] || return 1
-  (exec </dev/tty) 2>/dev/null
+  (exec 2>/dev/null; exec </dev/tty)
 }
 
 # ask "问题" "默认值"   回答放在 ANSWER 里
@@ -761,7 +761,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "config.json")
 
@@ -1111,7 +1111,8 @@ def account_info(force=False):
             data = {"logged_in": True, "email": j.get("email", CFG["apple_id"]), "name": j.get("name", "")}
         else:
             data = {"logged_in": False, "email": CFG["apple_id"], "error": explain_error(out)}
-        ACCOUNT.update(t=time.time(), data=data)
+        # 只缓存「已登录」：刚在 VPS 上登录完，网页马上就能看到。
+        ACCOUNT.update(t=time.time() if data["logged_in"] else 0, data=data)
         return data
 
 
@@ -1984,6 +1985,7 @@ json_error() {
 explain_login_error() {
   case "$1" in
     *[Ii]ncorrect*|*[Ii]nvalid*credential*|*password*) say_err "Apple ID 或密码不对" ;;
+    *验证码*) say_err "$1，再选一次「登录 Apple ID」重试" ;;
     *disabled*|*locked*) say_err "这个 Apple ID 被苹果锁住或停用了（也可能是账号/密码打错）。去 iforgot.apple.com 看看" ;;
     *[Kk]illed*|*memory*) say_err "内存不够，ipatool 被系统杀掉了。先停掉别的程序或者加虚拟内存再试" ;;
     *timeout*|*connection*|*dial*) say_err "连不上苹果服务器，检查一下 VPS 网络" ;;
@@ -2011,6 +2013,24 @@ apple_login() {
   return $rc_login
 }
 
+# ipatool 要验证码时不报错，只打一条普通消息（退出码还是 0），所以要看输出内容。
+needs_code() {
+  printf '%s' "$1" | grep -qiE '2FA code is required|--auth-code|auth code is required'
+}
+
+# 真登录成功：ipatool 说成功，而且钥匙串里确实能读到账号。
+login_ok() {
+  [ "$1" -eq 0 ] || return 1
+  needs_code "$2" && return 1
+  ipatool_run auth info | grep -q '"success":true'
+}
+
+login_error_text() {
+  e=$(json_error "$1")
+  [ -n "$e" ] || e=$(printf '%s' "$1" | tail -n 3)
+  printf '%s' "$e"
+}
+
 apple_login_loop() {
   tries=0
   while [ $tries -lt 3 ]; do
@@ -2024,33 +2044,39 @@ apple_login_loop() {
     say_info "正在登录…"
     out=$(ipatool_run auth login -e "$email" -p "$pw")
     rc=$?
-    if [ $rc -ne 0 ]; then
-      err=$(json_error "$out")
-      [ -n "$err" ] || err=$(printf '%s' "$out" | tail -n 3)
-      case "$err" in
-        *[Aa]uth*code*|*2[Ff][Aa]*|*two-factor*|*verification*)
-          say_info "这个 Apple ID 开了双重认证，苹果刚刚给你的 iPhone / Mac 发了 6 位验证码。"
-          ctry=0
-          while [ $ctry -lt 3 ]; do
-            ctry=$((ctry + 1))
-            ask "输入 6 位验证码" ""
-            code=$(printf '%s' "$ANSWER" | tr -cd '0-9')
-            [ ${#code} -eq 6 ] || { say_warn "验证码是 6 位数字"; continue; }
-            out=$(ipatool_run auth login -e "$email" -p "$pw" --auth-code "$code")
-            rc=$?
-            [ $rc -eq 0 ] && break
-            err=$(json_error "$out")
-            [ -n "$err" ] || err=$(printf '%s' "$out" | tail -n 3)
-            say_warn "验证码登录失败：$err"
-          done
-          ;;
-      esac
+    if needs_code "$out"; then
+      say_info "这个 Apple ID 开了双重认证。苹果刚给你的 iPhone / iPad / Mac 发了 6 位验证码"
+      say_info "（设备上先点「允许」才会显示验证码）。"
+      ctry=0
+      while [ $ctry -lt 3 ]; do
+        ctry=$((ctry + 1))
+        ask "输入 6 位验证码" ""
+        code=$(printf '%s' "$ANSWER" | tr -cd '0-9')
+        if [ ${#code} -ne 6 ]; then
+          say_warn "验证码是 6 位数字"
+          continue
+        fi
+        say_info "正在验证…"
+        out=$(ipatool_run auth login -e "$email" -p "$pw" --auth-code "$code")
+        rc=$?
+        if login_ok "$rc" "$out"; then break; fi
+        if needs_code "$out" || [ $rc -eq 0 ]; then
+          say_warn "验证码不对或者过期了。没收到新的话，在设备上打开「设置 → 你的名字 → 登录与安全 → 获取验证码」。"
+        else
+          say_warn "验证码登录失败：$(login_error_text "$out")"
+        fi
+      done
     fi
     pw=
-    if [ $rc -eq 0 ]; then
+    if login_ok "$rc" "$out"; then
       cfg_set apple_id "$email"
-      say_ok "Apple ID 登录成功"
+      say_ok "Apple ID 登录成功：$(apple_status)"
       return 0
+    fi
+    if needs_code "$out"; then
+      err="双重认证验证码没通过"
+    else
+      err=$(login_error_text "$out")
     fi
     [ $rc -eq 137 ] && err=Killed
     explain_login_error "$err"
