@@ -11,13 +11,18 @@
 #
 #   sh install.sh                    第一次：一问一答装好。装过：打开管理菜单
 #   sh install.sh --status           看看装得怎么样、网址是什么
-#   sh install.sh --login            登录 / 重新登录 Apple ID
+#   sh install.sh --login            重新登录正在用的 Apple ID（登录过期时用）
 #   sh install.sh --reset-password   换一把网页密码
 #   sh install.sh --settings         改端口、地区、保留时间、同时下载数
 #   sh install.sh --log              看最近的运行记录（排查问题用）
 #   sh install.sh --upgrade          更新本脚本和 ipatool
 #   sh install.sh --uninstall        卸载
 #   装好以后，以上命令都可以用 ipa-web 代替 sh install.sh，例如 ipa-web --status
+#
+# 切区（可以存好几个不同地区的 Apple ID，随时切换）
+#   qiequ                            打开切区菜单：切换、添加、重新登录、删除账号
+#   qiequ us                         直接切到美区账号（也可以写序号或邮箱，例如 qiequ 2）
+#   qiequ list                       看看存了哪些账号
 #
 # 名词小词典
 #   小鸡           从母鸡上切出来的虚拟机或容器（KVM、LXC、OpenVZ…），一般租到的 VPS 都是小鸡
@@ -26,12 +31,13 @@
 #   端口           网页地址里冒号后面的数字，例如 http://1.2.3.4:23456 里的 23456
 #   ipatool        真正去 App Store 下 ipa 的程序（github.com/majd/ipatool）
 #   钥匙串         ipatool 把 Apple ID 登录凭证加密存在 VPS 上的地方
+#   切区           换成另一个地区的 Apple ID。每个地区的 App Store 能下的 App 不一样
 #   双重认证码     登录 Apple ID 时，你 iPhone / Mac 上弹出的 6 位数字
 #   虚拟内存 swap  拿一块硬盘当内存用。慢，但小内存机器登录时不会被系统杀掉
 #   HTTPS          加密的网址（https://），需要一个解析到 VPS 的域名
 #======================================================================
 
-VERSION=1.0.1
+VERSION=1.1.0
 # ipaweb-onekey-begin
 
 REPO=imthnio/vps-ipatool
@@ -39,6 +45,7 @@ BASE=/opt/ipa-web
 CONF=$BASE/config.json
 LOG=/var/log/ipa-web.log
 CMD_LINK=/usr/local/bin/ipa-web
+QIEQU_LINK=/usr/local/bin/qiequ
 SVC=ipa-web
 SVC_CADDY=ipa-web-caddy
 IPATOOL_FALLBACK=2.7.0
@@ -118,13 +125,13 @@ ask_secret() {
   ANSWER=
   can_ask || return 1
   printf '%s' "${C_BOLD}$1${C_NC}: " >/dev/tty
-  stty -echo </dev/tty 2>/dev/null
+  stty -echo 2>/dev/null </dev/tty
   IFS= read -r ANSWER </dev/tty || ANSWER=
-  stty echo </dev/tty 2>/dev/null
+  stty echo 2>/dev/null </dev/tty
   printf '\n' >/dev/tty
 }
 
-restore_tty() { stty echo </dev/tty 2>/dev/null || true; }
+restore_tty() { stty echo 2>/dev/null </dev/tty || true; }
 
 need_root() {
   [ "$(id -u)" = 0 ] || die "请用 root 运行（先 sudo -i 或 su -）"
@@ -761,7 +768,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "config.json")
 
@@ -799,7 +806,33 @@ def load_config():
 
 
 CFG = load_config()
+CFG_STATE = {"mtime": os.stat(CONFIG_PATH).st_mtime}
+CFG_LOCK = threading.Lock()
 os.makedirs(CFG["data_dir"], exist_ok=True)
+
+
+def reload_config():
+    """qiequ 切区只改 config.json，这里发现变了就重新读，不用重启。"""
+    try:
+        m = os.stat(CONFIG_PATH).st_mtime
+    except OSError:
+        return
+    if m == CFG_STATE["mtime"]:
+        return
+    with CFG_LOCK:
+        if m == CFG_STATE["mtime"]:
+            return
+        try:
+            new = load_config()
+        except Exception as e:
+            log("重新读配置失败", e)
+            return
+        for k in ("home_dir", "country", "apple_id", "accounts", "active",
+                  "retention_minutes", "password_hash", "keychain_passphrase"):
+            if k in new:
+                CFG[k] = new[k]
+        CFG_STATE["mtime"] = m
+        log("配置变了，现在用 %s 区账号 %s" % (CFG["country"].upper(), CFG["apple_id"] or "（无）"))
 
 
 def log(*args):
@@ -866,13 +899,13 @@ def login_failed(ip):
 # 调 ipatool。每次都带上钥匙串口令、JSON 输出、非交互，
 # HOME 指到专用目录，登录凭证不会和系统里别的东西混在一起。
 #----------------------------------------------------------------------
-def ipatool(args, timeout=120):
+def ipatool(args, timeout=120, home=None):
     cmd = [CFG["ipatool_bin"]] + args + [
         "--format", "json",
         "--non-interactive",
         "--keychain-passphrase", CFG["keychain_passphrase"],
     ]
-    env = dict(os.environ, HOME=CFG["home_dir"])
+    env = dict(os.environ, HOME=home or CFG["home_dir"])
     if CFG["low_memory"]:
         # 小内存机器：让 ipatool（Go 程序）勤快点回收内存。
         env.update(GOMEMLIMIT="40MiB", GOGC="50")
@@ -903,9 +936,9 @@ def explain_error(text):
     raw = last_json(text).get("error") or (text or "").strip()[-400:] or "未知错误"
     low = raw.lower()
     if "keyring" in low or "failed to get account" in low:
-        return "VPS 上还没登录 Apple ID。请在 VPS 上运行 ipa-web 选「登录 / 重新登录 Apple ID」。"
+        return "VPS 上这个账号还没登录。请在 VPS 终端运行 qiequ，选 a 添加账号或 r 重新登录。"
     if "token" in low and ("expire" in low or "invalid" in low):
-        return "Apple ID 登录已过期。请在 VPS 上运行 ipa-web 选「登录 / 重新登录 Apple ID」。"
+        return "Apple ID 登录已过期。请在 VPS 终端运行 qiequ，选 r 重新登录这个账号。"
     if "password" in low and ("incorrect" in low or "invalid" in low):
         return "Apple ID 凭证失效，请在 VPS 上重新登录。"
     if "paid" in low or "price" in low or "payment" in low:
@@ -992,7 +1025,7 @@ def safe_filename(name, version):
 
 
 def job_public(j):
-    d = {k: j.get(k) for k in ("id", "app_id", "name", "version", "icon", "size",
+    d = {k: j.get(k) for k in ("id", "app_id", "name", "version", "icon", "size", "account", "country",
                                 "status", "error", "created", "finished", "filename")}
     if j["status"] == "running":
         d["bytes"] = dir_size(j["dir"])
@@ -1018,7 +1051,7 @@ def run_job(job):
         if job.get("ext_ver"):
             args += ["--external-version-id", job["ext_ver"]]
         # 大 App 可能好几个 G，给足两个小时。
-        rc, out = ipatool(args, timeout=7200)
+        rc, out = ipatool(args, timeout=7200, home=job["home"])
         info = last_json(out)
         ipa = None
         if rc == 0:
@@ -1054,6 +1087,9 @@ def new_job(app_id, ext_ver=""):
     jid = secrets.token_hex(8)
     job = {
         "id": jid,
+        "home": CFG["home_dir"],
+        "account": CFG["apple_id"],
+        "country": CFG["country"],
         "app_id": app_id,
         "ext_ver": ext_ver,
         "name": info.get("name") or str(app_id),
@@ -1097,22 +1133,23 @@ def cleaner():
 #----------------------------------------------------------------------
 # Apple ID 状态。auth info 要几秒，缓存一分钟。
 #----------------------------------------------------------------------
-ACCOUNT = {"t": 0, "data": None}
+ACCOUNT = {"t": 0, "data": None, "home": ""}
 ACCOUNT_LOCK = threading.Lock()
 
 
 def account_info(force=False):
     with ACCOUNT_LOCK:
-        if not force and ACCOUNT["data"] and time.time() - ACCOUNT["t"] < 60:
+        home = CFG["home_dir"]
+        if not force and ACCOUNT["data"] and ACCOUNT["home"] == home and time.time() - ACCOUNT["t"] < 60:
             return ACCOUNT["data"]
-        rc, out = ipatool(["auth", "info"], timeout=60)
+        rc, out = ipatool(["auth", "info"], timeout=60, home=home)
         j = last_json(out)
         if rc == 0 and j.get("success", True):
             data = {"logged_in": True, "email": j.get("email", CFG["apple_id"]), "name": j.get("name", "")}
         else:
             data = {"logged_in": False, "email": CFG["apple_id"], "error": explain_error(out)}
         # 只缓存「已登录」：刚在 VPS 上登录完，网页马上就能看到。
-        ACCOUNT.update(t=time.time() if data["logged_in"] else 0, data=data)
+        ACCOUNT.update(t=time.time() if data["logged_in"] else 0, data=data, home=home)
         return data
 
 
@@ -1177,6 +1214,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- 路由 ----
     def do_GET(self):
+        reload_config()
         u = urllib.parse.urlparse(self.path)
         q = urllib.parse.parse_qs(u.query)
         path = u.path
@@ -1191,6 +1229,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({
                     "account": account_info(force=q.get("force") == ["1"]),
                     "country": CFG["country"],
+                    "accounts": [{"email": a.get("email", ""), "country": a.get("country", ""),
+                                  "active": a.get("id") == CFG.get("active")}
+                                 for a in (CFG.get("accounts") or [])],
                     "retention_minutes": CFG["retention_minutes"],
                     "max_concurrent": CFG["max_concurrent"],
                     "disk_free": shutil.disk_usage(CFG["data_dir"]).free,
@@ -1219,6 +1260,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def do_POST(self):
+        reload_config()
         path = urllib.parse.urlparse(self.path).path
         try:
             if path == "/api/login":
@@ -1238,7 +1280,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json({"error": "VPS 硬盘剩余不到 300MB，先清理一下再下"}, 507)
                 with JOBS_LOCK:
                     for j in JOBS.values():
-                        if j["app_id"] == app_id and j["ext_ver"] == ext_ver and j["status"] in ("queued", "running", "done"):
+                        if (j["app_id"] == app_id and j["ext_ver"] == ext_ver and j["home"] == CFG["home_dir"]
+                                and j["status"] in ("queued", "running", "done")):
                             return self.send_json({"job": j["id"], "existing": True})
                 job = new_job(app_id, ext_ver)
                 return self.send_json({"job": job["id"]})
@@ -1563,7 +1606,9 @@ function showLogin() {
 
 // ---------------- 主页面 ----------------
 let pollTimer = null;
-const stopPoll = () => { clearTimeout(pollTimer); pollTimer = null; };
+let statusTimer = null;
+let lastCountry = "";
+const stopPoll = () => { clearTimeout(pollTimer); pollTimer = null; clearInterval(statusTimer); statusTimer = null; };
 
 function showMain() {
   root.innerHTML = `
@@ -1586,20 +1631,29 @@ function showMain() {
   $("#sf").onsubmit = e => { e.preventDefault(); doSearch(); };
   loadStatus();
   pollJobs();
+  // 在 VPS 上用 qiequ 切区后，这里过一会儿自己更新。
+  clearInterval(statusTimer);
+  statusTimer = setInterval(() => { if ($("#acct")) loadStatus(); }, 15000);
 }
 
 async function loadStatus() {
   try {
     const s = await api("/api/status");
-    const a = s.account, el = $("#acct");
+    const a = s.account, el = $("#acct"), cc = s.country.toUpperCase();
     if (a.logged_in) {
-      el.className = "chip ok"; el.textContent = "Apple ID：" + (a.email || a.name || "已登录");
+      el.className = "chip ok"; el.textContent = `${cc} 区 · ${a.email || a.name || "已登录"}`;
       $("#banner").innerHTML = "";
     } else {
-      el.className = "chip err"; el.textContent = "Apple ID 未登录";
+      el.className = "chip err"; el.textContent = `${cc} 区 · 未登录`;
       $("#banner").innerHTML = `<div class="banner err">${esc(a.error || "VPS 上还没登录 Apple ID")}</div>`;
     }
-    $("#hint").textContent = `App Store 地区：${s.country.toUpperCase()} · 下好的文件在 VPS 上保留 ${s.retention_minutes} 分钟 · 同时下载 ${s.max_concurrent} 个 · VPS 剩余空间 ${mb(s.disk_free)}。ipa 带苹果加密，只能装到登录同一个 Apple ID 的设备上。`;
+    const n = (s.accounts || []).length;
+    $("#hint").textContent = `App Store 地区：${cc}${n > 1 ? `（存了 ${n} 个账号：${s.accounts.map(x => x.country.toUpperCase()).join("、")}，在 VPS 终端运行 qiequ 切区）` : "（在 VPS 终端运行 qiequ 切区）"} · 下好的文件在 VPS 上保留 ${s.retention_minutes} 分钟 · 同时下载 ${s.max_concurrent} 个 · VPS 剩余空间 ${mb(s.disk_free)}。ipa 带苹果加密，只能装到登录同一个 Apple ID 的设备上。`;
+    // 切区以后，旧地区的搜索结果可能下不了，清掉。
+    if (lastCountry && lastCountry !== cc && $("#results")) {
+      $("#results").innerHTML = `<div class="card empty">已切到 ${cc} 区，重新搜索一下</div>`;
+    }
+    lastCountry = cc;
   } catch (e) {}
 }
 
@@ -1683,7 +1737,8 @@ async function pollJobs() {
 
 function jobRow(j) {
   let line = "", bar = "", acts = "";
-  const name = esc(j.name) + (j.version ? ` <span class="sub">v${esc(j.version)}</span>` : "");
+  const name = esc(j.name) + (j.version ? ` <span class="sub">v${esc(j.version)}</span>` : "") +
+    (j.country ? ` <span class="sub">· ${esc(j.country.toUpperCase())} 区 ${esc(j.account || "")}</span>` : "");
   if (j.status === "queued") {
     line = `<span class="st-queued">排队中（第 ${j.queue_pos} 个）</span>`;
     acts = `<button class="small" data-del="${j.id}">取消</button>`;
@@ -1753,6 +1808,17 @@ install_self() {
   mkdir -p "$(dirname "$CMD_LINK")"
   if [ "$src" != "$CMD_LINK" ]; then
     cp -f "$src" "$CMD_LINK.tmp" && chmod 755 "$CMD_LINK.tmp" && mv -f "$CMD_LINK.tmp" "$CMD_LINK"
+  fi
+  # 切区快捷命令。别的程序已经占了 qiequ 这个名字就不覆盖。
+  if [ -e "$QIEQU_LINK" ] && ! grep -q 'ipa-web' "$QIEQU_LINK" 2>/dev/null; then
+    say_warn "$QIEQU_LINK 已经是别的程序，切区请用 ipa-web --qiequ"
+  else
+    cat > "$QIEQU_LINK" <<EOF
+#!/bin/sh
+# 切区：切换 / 添加 / 删除 Apple ID 账号（ipa-web 装的快捷命令）
+exec $CMD_LINK --qiequ "\$@"
+EOF
+    chmod 755 "$QIEQU_LINK"
   fi
 }
 
@@ -1965,17 +2031,146 @@ EOF
 }
 
 #----------------------------------------------------------------------
-# 登录 Apple ID。凭证加密存在 $BASE/home 里，口令在 config.json。
+# Apple ID 账号。可以存好几个不同地区的账号，用 qiequ 切换。
+#   每个账号一个目录 $BASE/accounts/<编号>，各放各的登录凭证（钥匙串口令在 config.json）；
+#   苹果的组件缓存（约 60MB）大家共用 $BASE/cache，省硬盘。
+#   config.json 里 accounts 是账号列表，active 是正在用的那个。
+#   home_dir / country / apple_id 跟着正在用的账号走，网页程序只看这三个，
+#   改了它会自己发现，不用重启，正在下的任务也不受影响。
 #----------------------------------------------------------------------
+ACCT_HOME=
+
 ipatool_run() {
+  h=$ACCT_HOME
+  [ -n "$h" ] || h=$(cfg_get home_dir)
+  [ -n "$h" ] || h=$BASE/home
   if low_mem; then
     # Go 程序的内存回收设紧一点，实测登录峰值能少 20MB 左右。
-    GOMEMLIMIT=40MiB GOGC=50 HOME="$BASE/home" "$BASE/bin/ipatool" "$@" --format json --non-interactive \
+    GOMEMLIMIT=40MiB GOGC=50 HOME="$h" "$BASE/bin/ipatool" "$@" --format json --non-interactive \
       --keychain-passphrase "$(cfg_get keychain_passphrase)" 2>&1
   else
-    HOME="$BASE/home" "$BASE/bin/ipatool" "$@" --format json --non-interactive \
+    HOME="$h" "$BASE/bin/ipatool" "$@" --format json --non-interactive \
       --keychain-passphrase "$(cfg_get keychain_passphrase)" 2>&1
   fi
+}
+
+# 账号列表的增删改查都交给 Python，config.json 不会被写坏。
+acct_py() {
+  python3 - "$CONF" "$@" <<'IPAWEB_ACCT_PY'
+import json, os, sys
+path, cmd, args = sys.argv[1], sys.argv[2], sys.argv[3:]
+c = json.load(open(path))
+accts = c.get("accounts") or []
+
+
+def save():
+    c["accounts"] = accts
+    act = next((a for a in accts if a["id"] == c.get("active")), None)
+    if act:
+        c["home_dir"], c["country"], c["apple_id"] = act["home"], act["country"], act["email"]
+    else:
+        c["active"] = ""
+        c["apple_id"] = ""
+        c["home_dir"] = os.path.join(os.path.dirname(path), "home")
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(c, f, ensure_ascii=False, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def find(q):
+    q = q.strip().lower()
+    if q.isdigit() and 1 <= int(q) <= len(accts) and len(q) <= 3:
+        return accts[int(q) - 1]
+    for a in accts:
+        if q in (a["id"], a["email"].lower()):
+            return a
+    same = [a for a in accts if a["country"] == q]
+    # 同一个地区存了好几个，优先切到不是当前的那个。
+    return next((a for a in same if a["id"] != c.get("active")), same[0] if same else None)
+
+
+if cmd == "list":
+    for i, a in enumerate(accts, 1):
+        print("|".join([str(i), a["id"], a["email"], a["country"], a["home"],
+                        "1" if a["id"] == c.get("active") else "0"]))
+elif cmd == "find":
+    a = find(args[0])
+    if not a:
+        sys.exit(1)
+    print(a["id"])
+elif cmd == "get":
+    a = next((a for a in accts if a["id"] == args[0]), None)
+    if not a:
+        sys.exit(1)
+    print(a.get(args[1], ""))
+elif cmd == "add":
+    accts = [a for a in accts if a["id"] != args[0]]
+    accts.append({"id": args[0], "email": args[1], "country": args[2], "home": args[3]})
+    save()
+elif cmd == "set":
+    for a in accts:
+        if a["id"] == args[0]:
+            a[args[1]] = args[2]
+    save()
+elif cmd == "use":
+    if not any(a["id"] == args[0] for a in accts):
+        sys.exit(1)
+    c["active"] = args[0]
+    save()
+elif cmd == "del":
+    accts = [a for a in accts if a["id"] != args[0]]
+    if c.get("active") == args[0]:
+        c["active"] = accts[0]["id"] if accts else ""
+    save()
+elif cmd == "migrate":
+    # 1.0.x 只有一个账号，直接放在 home_dir：变成账号列表里的第一个。
+    if "accounts" in c:
+        sys.exit(0)
+    home = c.get("home_dir") or ""
+    if home and os.path.exists(os.path.join(home, ".ipatool", "account")):
+        accts = [{"id": args[0], "email": str(c.get("apple_id", "")),
+                  "country": str(c.get("country", "cn")), "home": home}]
+        c["active"] = args[0]
+    save()
+IPAWEB_ACCT_PY
+}
+
+new_acct_id() {
+  printf 'a%s' "$(tr -dc 'a-z0-9' < /dev/urandom 2>/dev/null | head -c 6)"
+}
+
+acct_migrate() {
+  [ -f "$CONF" ] || return 0
+  acct_py migrate "$(new_acct_id)" || true
+  # 1.0.x 的组件缓存在旧账号目录里，挪到公共位置给所有账号共用。
+  h=$(cfg_get home_dir)
+  case "$h" in "$BASE"/*) ;; *) return 0 ;; esac
+  if [ -d "$h/.cache" ] && [ ! -L "$h/.cache" ] && [ ! -e "$BASE/cache" ]; then
+    mv "$h/.cache" "$BASE/cache" && ln -s "$BASE/cache" "$h/.cache"
+  fi
+}
+
+acct_count() {
+  acct_py list | grep -c .
+}
+
+acct_active_index() {
+  acct_py list | awk -F'|' '$6 == 1 {print $1}'
+}
+
+upper() {
+  printf '%s' "$1" | tr 'a-z' 'A-Z'
+}
+
+# 某个账号目录里的登录还有没有效。
+acct_home_ok() {
+  ACCT_HOME=$1
+  ipatool_run auth info | grep -q '"success":true'
+  ok_rc=$?
+  ACCT_HOME=
+  return $ok_rc
 }
 
 json_error() {
@@ -1985,7 +2180,7 @@ json_error() {
 explain_login_error() {
   case "$1" in
     *[Ii]ncorrect*|*[Ii]nvalid*credential*|*password*) say_err "Apple ID 或密码不对" ;;
-    *验证码*) say_err "$1，再选一次「登录 Apple ID」重试" ;;
+    *验证码*) say_err "$1，再登录一次重试" ;;
     *disabled*|*locked*) say_err "这个 Apple ID 被苹果锁住或停用了（也可能是账号/密码打错）。去 iforgot.apple.com 看看" ;;
     *[Kk]illed*|*memory*) say_err "内存不够，ipatool 被系统杀掉了。先停掉别的程序或者加虚拟内存再试" ;;
     *timeout*|*connection*|*dial*) say_err "连不上苹果服务器，检查一下 VPS 网络" ;;
@@ -1993,11 +2188,19 @@ explain_login_error() {
   esac
 }
 
+# apple_login 账号目录 邮箱：把这个 Apple ID 登录到这个目录。
 apple_login() {
-  say_step "登录 Apple ID"
-  say_info "用来下载的 Apple ID。建议用一个小号；免费 App 会自动「领取」到这个账号。"
-  say_info "密码只交给 ipatool 登录用，不会写进任何文件。登录凭证加密保存在 $BASE/home。"
-  say_info "第一次登录 ipatool 要先准备一些文件，可能要等一两分钟。"
+  ACCT_HOME=$1
+  mkdir -p "$ACCT_HOME"
+  chmod 700 "$ACCT_HOME"
+  if [ ! -e "$ACCT_HOME/.cache" ]; then
+    mkdir -p "$BASE/cache"
+    ln -s "$BASE/cache" "$ACCT_HOME/.cache"
+  fi
+  say_info "密码只交给 ipatool 登录用，不会写进任何文件。登录凭证加密保存在 $ACCT_HOME。"
+  if [ ! -d "$BASE/cache/ipatool" ] && [ ! -d "$ACCT_HOME/.cache/ipatool" ]; then
+    say_info "第一次登录 ipatool 要先准备一些文件，可能要等一两分钟。"
+  fi
   PAUSED_WEB=
   if low_mem && web_alive; then
     say_info "内存小，登录时先暂停网页服务腾内存，登录完自动恢复。"
@@ -2005,11 +2208,12 @@ apple_login() {
     PAUSED_WEB=1
   fi
   low_mem && drop_page_cache
-  apple_login_loop
+  apple_login_loop "$2"
   rc_login=$?
   if [ -n "$PAUSED_WEB" ]; then
     restart_all >/dev/null || say_warn "网页服务没恢复，运行 ipa-web --restart"
   fi
+  ACCT_HOME=
   return $rc_login
 }
 
@@ -2032,13 +2236,11 @@ login_error_text() {
 }
 
 apple_login_loop() {
+  email=$1
   tries=0
   while [ $tries -lt 3 ]; do
     tries=$((tries + 1))
-    ask "Apple ID 邮箱（或手机号）" "$(cfg_get apple_id)"
-    email=$ANSWER
-    [ -n "$email" ] || { say_warn "不能为空"; continue; }
-    ask_secret "Apple ID 密码（输入时不显示）" || return 1
+    ask_secret "$email 的密码（输入时不显示）" || return 1
     pw=$ANSWER
     [ -n "$pw" ] || { say_warn "密码不能为空"; continue; }
     say_info "正在登录…"
@@ -2069,8 +2271,7 @@ apple_login_loop() {
     fi
     pw=
     if login_ok "$rc" "$out"; then
-      cfg_set apple_id "$email"
-      say_ok "Apple ID 登录成功：$(apple_status)"
+      say_ok "Apple ID 登录成功：$email"
       return 0
     fi
     if needs_code "$out"; then
@@ -2093,6 +2294,153 @@ apple_status() {
   else
     printf '未登录'
   fi
+}
+
+#----------------------------------------------------------------------
+# 切区：添加、切换、重新登录、删除账号。
+#----------------------------------------------------------------------
+ask_country() {
+  say_info "常用：cn 中国大陆　us 美国　hk 香港　tw 台湾　jp 日本　kr 韩国　sg 新加坡　gb 英国"
+  while :; do
+    ask "这个 Apple ID 是哪个地区的（地区代码）" "$1"
+    c=$(printf '%s' "$ANSWER" | tr 'A-Z' 'a-z')
+    if printf '%s' "$c" | grep -qE '^[a-z]{2}$'; then
+      Q_ACCT_COUNTRY=$c
+      return 0
+    fi
+    can_ask || die "地区代码不对：$ANSWER"
+    say_warn "是两个字母，例如 cn、us、hk"
+  done
+}
+
+acct_print() {
+  acct_py list | while IFS='|' read -r i id em co home act; do
+    if [ "$act" = 1 ]; then
+      printf '  %s) %s  %s  %s\n' "$i" "$(upper "$co")" "$em" "${C_GREEN}← 正在用${C_NC}"
+    else
+      printf '  %s) %s  %s\n' "$i" "$(upper "$co")" "$em"
+    fi
+  done
+}
+
+# acct_add [地区]：登录一个新的 Apple ID 并存起来。给了地区就不再问。
+acct_add() {
+  say_step "添加 Apple ID 账号"
+  say_info "建议用小号。免费 App 会自动「领取」到这个账号。"
+  ask "Apple ID 邮箱（或手机号）" ""
+  email=$ANSWER
+  [ -n "$email" ] || { say_warn "没填，取消"; return 1; }
+  old=$(acct_py find "$email" 2>/dev/null)
+  if [ -n "$old" ] && [ "$(acct_py get "$old" email)" = "$email" ]; then
+    say_info "这个账号已经存过了，改成重新登录它。"
+    acct_relogin "$old"
+    return
+  fi
+  if [ -n "$1" ]; then Q_ACCT_COUNTRY=$1; else ask_country "cn"; fi
+  id=$(new_acct_id)
+  home=$BASE/accounts/$id
+  if apple_login "$home" "$email"; then
+    acct_py add "$id" "$email" "$Q_ACCT_COUNTRY" "$home"
+    say_ok "已保存：$(upper "$Q_ACCT_COUNTRY")  $email"
+    if [ -z "$(cfg_get active)" ] || ask_yn "现在就切到这个账号吗？" y; then
+      acct_use "$id" quiet
+    fi
+    return 0
+  fi
+  rm -rf "$home"
+  return 1
+}
+
+acct_relogin() {
+  em=$(acct_py get "$1" email) || { say_err "找不到这个账号"; return 1; }
+  say_step "重新登录 $em（$(upper "$(acct_py get "$1" country)")）"
+  apple_login "$(acct_py get "$1" home)" "$em"
+}
+
+# acct_use 编号 [quiet]：切到这个账号，网页马上生效。
+acct_use() {
+  acct_py use "$1" || { say_err "找不到这个账号"; return 1; }
+  em=$(acct_py get "$1" email)
+  co=$(upper "$(acct_py get "$1" country)")
+  say_ok "已切到 $co 区：$em（网页刷新一下就是新的地区）"
+  [ "$2" = quiet ] && return 0
+  say_info "检查登录还有没有效…"
+  if acct_home_ok "$(acct_py get "$1" home)"; then
+    say_ok "登录有效，可以直接下载"
+  else
+    say_warn "这个账号的登录已经失效了（苹果的登录凭证会过期）。"
+    if can_ask && ask_yn "现在重新登录吗？" y; then acct_relogin "$1"; fi
+  fi
+}
+
+acct_delete() {
+  em=$(acct_py get "$1" email) || { say_err "找不到这个账号"; return 1; }
+  home=$(acct_py get "$1" home)
+  ask_yn "确定删除 $em 吗？（删掉 VPS 上的登录凭证，Apple ID 本身不受影响）" n || return 0
+  acct_py del "$1"
+  case "$home" in "$BASE"/*) rm -rf "$home" ;; esac
+  say_ok "删好了"
+  if [ -n "$(cfg_get active)" ]; then
+    say_info "现在用的是：$(upper "$(cfg_get country)")  $(cfg_get apple_id)"
+  else
+    say_warn "一个账号都没有了，网页下载不了。运行 qiequ 选 a 添加一个。"
+  fi
+}
+
+# 让用户选一个账号，编号放在 PICKED。
+acct_pick() {
+  ask "$1（输入序号）" "$2"
+  PICKED=$(acct_py find "$ANSWER" 2>/dev/null)
+  [ -n "$PICKED" ] || { say_warn "没有这个账号"; return 1; }
+}
+
+qiequ_menu() {
+  while :; do
+    printf '\n%s\n' "${C_BOLD}======== 切区 / Apple ID 账号 ========${C_NC}"
+    if [ "$(acct_count)" -eq 0 ]; then
+      printf '  还没有存账号\n'
+    else
+      acct_print
+    fi
+    printf '\n'
+    [ "$(acct_count)" -gt 0 ] && printf '  输入序号：切到那个账号（也可以输地区代码，例如 us）\n'
+    printf '  a) 添加账号（登录一个新的 Apple ID）\n'
+    [ "$(acct_count)" -gt 0 ] && printf '  r) 重新登录某个账号（网页提示登录过期时用）\n'
+    [ "$(acct_count)" -gt 0 ] && printf '  d) 删除某个账号\n'
+    printf '  0) 退出\n'
+    ask "选哪个" "0"
+    case "$ANSWER" in
+      0|q|Q|'') return 0 ;;
+      a|A) acct_add ;;
+      r|R) acct_pick "重新登录哪个" "$(acct_active_index)" && acct_relogin "$PICKED" ;;
+      d|D) acct_pick "删除哪个" "" && acct_delete "$PICKED" ;;
+      *)
+        id=$(acct_py find "$ANSWER" 2>/dev/null)
+        if [ -n "$id" ]; then
+          acct_use "$id"
+          return 0
+        fi
+        say_warn "没有这个选项"
+        ;;
+    esac
+  done
+}
+
+qiequ_main() {
+  must_installed
+  lock_take
+  acct_migrate
+  case "${1:-}" in
+    '') qiequ_menu ;;
+    list|ls|-l) acct_print ;;
+    add|-a) acct_add ;;
+    -h|--help) sed -n '/^# 切区（/,/^# qiequ list/p' "$CMD_LINK" | sed 's/^#//' ;;
+    *)
+      id=$(acct_py find "$1" 2>/dev/null) || id=
+      [ -n "$id" ] || { acct_print; die "没找到「$1」。可以写序号、地区代码或邮箱"; }
+      acct_use "$id"
+      ;;
+  esac
 }
 
 #----------------------------------------------------------------------
@@ -2125,8 +2473,12 @@ show_status() {
   printf '打开网址：\n'
   web_urls | sed 's/^/  /'
   printf '网页密码：忘了就运行 ipa-web --reset-password 换一个\n'
-  printf 'Apple ID：%s\n' "$(apple_status)"
-  printf 'App Store 地区：%s\n' "$(cfg_get country | tr 'a-z' 'A-Z')"
+  acct_migrate
+  printf 'Apple ID：%s（%s 区）\n' "$(apple_status)" "$(upper "$(cfg_get country)")"
+  if [ "$(acct_count)" -gt 1 ]; then
+    printf '存了 %s 个账号，运行 qiequ 切区：\n' "$(acct_count)"
+    acct_print
+  fi
   printf '文件保留：%s 分钟　同时下载：%s 个\n' "$(cfg_get retention_minutes)" "$(cfg_get max_concurrent)"
   printf 'ipatool：%s　脚本：%s\n' "$(ipatool_version)" "$VERSION"
   printf '程序目录：%s　日志：%s\n' "$BASE" "$LOG"
@@ -2342,6 +2694,10 @@ write_config() {
     public_ipv4 "$PUB4" public_ipv6 "$PUB6" nat "$NAT" script_version "$VERSION"
   if low_mem; then cfg_set low_memory true; else cfg_set low_memory false; fi
   set_web_password "$Q_PASSWORD"
+  # 重装时已经存了账号：home_dir / country 恢复成正在用的账号的。
+  acct_migrate
+  act=$(cfg_get active)
+  [ -n "$act" ] && acct_py use "$act"
   if [ -n "$old_port" ] && [ "$old_port" != "$Q_PORT" ]; then close_firewall "$old_port"; fi
 }
 
@@ -2383,13 +2739,16 @@ fresh_install() {
     exit 1
   fi
 
-  if can_ask && ask_yn "现在登录 Apple ID 吗？（不登录就下不了，以后也可以运行 ipa-web --login）" y; then
-    apple_login || say_warn "Apple ID 还没登录，之后运行 ipa-web --login 再登"
+  if [ -n "$(cfg_get active)" ] && acct_home_ok "$(cfg_get home_dir)"; then
+    say_ok "保存的 Apple ID 账号都还在，正在用：$(upper "$(cfg_get country)")  $(cfg_get apple_id)"
+  elif can_ask && ask_yn "现在登录 Apple ID 吗？（不登录就下不了，以后也可以运行 qiequ 添加）" y; then
+    acct_add "$Q_COUNTRY" || say_warn "Apple ID 还没登录，之后运行 qiequ 选 a 添加"
   fi
 
   show_status
   printf '%s\n' "${C_GREEN}${C_BOLD}装好了！${C_NC} 在电脑浏览器打开上面的网址，输入网页密码：${C_BOLD}$Q_PASSWORD${C_NC}"
-  printf '以后管理（改设置、重新登录、更新、卸载）：直接运行 %sipa-web%s\n' "$C_BOLD" "$C_NC"
+  printf '以后管理（改设置、更新、卸载）：直接运行 %sipa-web%s\n' "$C_BOLD" "$C_NC"
+  printf '切区（存多个地区的 Apple ID，随时切换）：运行 %sqiequ%s\n' "$C_BOLD" "$C_NC"
   if [ "$NAT" = 1 ]; then
     say_warn "NAT 小鸡：如果打不开，检查商家面板里外网端口 $Q_PUBLIC_PORT 是否映射到了内网端口 $Q_PORT。"
   elif [ -z "$Q_DOMAIN" ]; then
@@ -2425,7 +2784,7 @@ ask_questions_settings() {
   while :; do
     printf '\n%s\n' "${C_BOLD}改设置${C_NC}"
     printf '  1) 端口（现在 %s）\n' "$(cfg_get listen_port)"
-    printf '  2) App Store 地区（现在 %s）\n' "$(cfg_get country | tr 'a-z' 'A-Z')"
+    printf '  2) 当前账号的地区（现在 %s，切换账号请用 qiequ）\n' "$(cfg_get country | tr 'a-z' 'A-Z')"
     printf '  3) 文件保留时间（现在 %s 分钟）\n' "$(cfg_get retention_minutes)"
     printf '  4) 同时下载数（现在 %s 个）\n' "$(cfg_get max_concurrent)"
     printf '  0) 返回\n'
@@ -2454,7 +2813,8 @@ ask_questions_settings() {
         ask "地区代码（cn us hk tw jp kr sg gb…）" "$(cfg_get country)"
         c=$(printf '%s' "$ANSWER" | tr 'A-Z' 'a-z')
         printf '%s' "$c" | grep -qE '^[a-z]{2}$' || { say_warn "是两个字母"; continue; }
-        cfg_set country "$c"
+        act=$(cfg_get active)
+        if [ -n "$act" ]; then acct_py set "$act" country "$c"; else cfg_set country "$c"; fi
         ;;
       3)
         ask "保留多少分钟" "$(cfg_get retention_minutes)"
@@ -2474,7 +2834,10 @@ ask_questions_settings() {
 
 do_login() {
   must_installed
-  apple_login
+  lock_take
+  acct_migrate
+  act=$(cfg_get active)
+  if [ -n "$act" ]; then acct_relogin "$act"; else acct_add; fi
 }
 
 do_log() {
@@ -2499,6 +2862,7 @@ apply_update() {
   write_app_files
   write_run_scripts
   install_self "$SELF"
+  acct_migrate
   cfg_set script_version "$VERSION"
   if restart_all; then say_ok "更新好了（脚本 $VERSION，ipatool $(ipatool_version)）"; else say_err "更新后网页服务没起来，运行 ipa-web --log 看看"; fi
 }
@@ -2540,6 +2904,7 @@ do_uninstall() {
   fi
   rm -rf "$BASE" "$LOG"
   rm -f "$CMD_LINK"
+  if grep -q 'ipa-web' "$QIEQU_LINK" 2>/dev/null; then rm -f "$QIEQU_LINK"; fi
   say_ok "卸载干净了"
 }
 
@@ -2553,7 +2918,7 @@ main_menu() {
   while :; do
     printf '\n%s\n' "${C_BOLD}======== ipa-web 管理 v$VERSION ========${C_NC}"
     printf '  1) 查看状态 / 网址\n'
-    printf '  2) 登录 / 重新登录 Apple ID\n'
+    printf '  2) 切区 / 管理 Apple ID 账号（也可以直接运行 qiequ）\n'
     printf '  3) 修改网页密码\n'
     printf '  4) 改设置（端口、地区、保留时间、同时下载数）\n'
     printf '  5) 重启网页服务\n'
@@ -2565,7 +2930,7 @@ main_menu() {
     ask "选哪个" "0"
     case "$ANSWER" in
       1) show_status ;;
-      2) apple_login ;;
+      2) (qiequ_main) ;;
       3) do_reset_password ;;
       4) (do_settings) ;;
       5) do_restart ;;
@@ -2579,7 +2944,7 @@ main_menu() {
 }
 
 usage() {
-  sed -n '2,25p' "$SELF" 2>/dev/null | sed 's/^#//'
+  sed -n '2,31p' "$SELF" 2>/dev/null | sed 's/^#//'
 }
 
 #----------------------------------------------------------------------
@@ -2593,6 +2958,7 @@ esac
 case "${1:-}" in
   --status) need_root; show_status ;;
   --login) need_root; do_login ;;
+  --qiequ) need_root; shift; qiequ_main "$@" ;;
   --reset-password) need_root; do_reset_password ;;
   --settings) need_root; do_settings ;;
   --log) do_log "${2:-60}" ;;
