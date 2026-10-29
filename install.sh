@@ -16,6 +16,7 @@
 #   sh install.sh --settings         改端口、地区、保留时间、同时下载数
 #   sh install.sh --log              看最近的运行记录（排查问题用）
 #   sh install.sh --upgrade          更新本脚本和 ipatool
+#   sh install.sh --swap             按机器配置自动开虚拟内存（小内存机器登录被杀时用）
 #   sh install.sh --uninstall        卸载
 #   装好以后，以上命令都可以用 ipa-web 代替 sh install.sh，例如 ipa-web --status
 #
@@ -37,7 +38,7 @@
 #   HTTPS          加密的网址（https://），需要一个解析到 VPS 的域名
 #======================================================================
 
-VERSION=1.1.0
+VERSION=1.2.0
 # ipaweb-onekey-begin
 
 REPO=imthnio/vps-ipatool
@@ -237,6 +238,11 @@ kernel_ok() {
 #   先看是不是容器（LXC、OpenVZ、Docker、Podman…），再看是不是虚拟机（KVM、VMware…）。
 #   两样都不是，就是物理机 = 母鸡。物理机上装了 PVE、libvirt 这些开小鸡的软件，就是正在开小鸡的母鸡。
 #----------------------------------------------------------------------
+# 根目录是什么文件系统。Docker 一般是 overlay。
+root_fstype() {
+  awk '$5 == "/" { for (i = 6; i <= NF; i++) if ($i == "-") { print $(i + 1); exit } }' /proc/self/mountinfo 2>/dev/null
+}
+
 detect_virt() {
   ctn=
   vmn=
@@ -260,6 +266,13 @@ detect_virt() {
       ctn=$(tr '\0' '\n' < /proc/1/environ | sed -n 's/^container=//p' | head -n 1)
     elif grep -qE '/(docker|kubepods|containerd)' /proc/1/cgroup 2>/dev/null; then
       ctn=docker
+    elif [ -s /run/systemd/container ]; then
+      ctn=$(head -n 1 /run/systemd/container)
+    elif [ "$(root_fstype)" = overlay ] || [ "$(root_fstype)" = aufs ]; then
+      ctn=docker
+    elif [ -e /sys/fs/cgroup/memory.max ] && [ -e /sys/fs/cgroup/cgroup.controllers ]; then
+      # cgroup v2 的根目录没有 memory.max；看得到它，说明这台机器被关在别人的 cgroup 里，就是容器。
+      ctn=容器
     elif [ -e /proc/vz ] && [ ! -d /proc/bc ]; then
       ctn=openvz
     fi
@@ -539,18 +552,90 @@ install_deps() {
 # 容器小鸡（LXC、OpenVZ、Docker）自己加不了，只能提醒。
 #----------------------------------------------------------------------
 SWAP_FILE=/ipa-web.swap
+# 内存加虚拟内存凑到这么多，ipatool 第一次登录（要先下苹果的组件）也不会被杀。
+SWAP_TARGET_MB=1024
+# 少于这么多就不值得加了。
+SWAP_MIN_MB=128
+# 加完以后硬盘至少还要剩这么多，给下载 ipa 用。
+DISK_KEEP_MB=768
+# 内存加虚拟内存低于这个数，登录基本必挂，硬盘紧也要挤一块出来。
+SWAP_CRITICAL_MB=320
 
 # ipatool 登录时实测要 110~180MB（第一次更多），内存加虚拟内存不到 640MB 就建议加。
 need_swap() {
   [ $((MEM_MB + SWAP_MB)) -lt 640 ]
 }
 
-swap_size_for_disk() {
-  if [ "$DISK_MB" -gt 3072 ]; then echo 1024
-  elif [ "$DISK_MB" -gt 1536 ]; then echo 512
-  elif [ "$DISK_MB" -gt 1024 ]; then echo 256
-  else echo 0
+# 按这台机器的内存、已有虚拟内存、硬盘剩余算出要加多少 MB。0 表示不用加或者加不了。
+#   IPAWEB_SWAP_MB=512 指定大小，IPAWEB_SWAP_MB=0 不加。
+swap_plan_mb() {
+  if [ -n "${IPAWEB_SWAP_MB:-}" ]; then
+    case "$IPAWEB_SWAP_MB" in *[!0-9]*) echo 0 ;; *) echo "$IPAWEB_SWAP_MB" ;; esac
+    return
   fi
+  [ "$VIRT_KIND" != container ] || { echo 0; return; }
+  [ -z "${SWAP_DENIED:-}" ] || { echo 0; return; }
+  need_swap || { echo 0; return; }
+  sp_have=$((MEM_MB + SWAP_MB))
+  sp_want=$((SWAP_TARGET_MB - sp_have))
+  [ "$sp_want" -gt 0 ] || { echo 0; return; }
+  sp_cap=$((DISK_MB - DISK_KEEP_MB))
+  sp_third=$((DISK_MB / 3))
+  if [ "$sp_have" -lt "$SWAP_CRITICAL_MB" ] && [ "$sp_third" -gt "$sp_cap" ]; then
+    sp_cap=$sp_third
+  fi
+  [ "$sp_want" -le "$sp_cap" ] || sp_want=$sp_cap
+  # 凑成 64MB 的整数倍
+  sp_want=$((sp_want / 64 * 64))
+  [ "$sp_want" -ge "$SWAP_MIN_MB" ] || sp_want=0
+  echo "$sp_want"
+}
+
+# swap_probe：用 1MB 的小文件试一下系统让不让开虚拟内存。
+#   不让（容器、或者商家禁了）就记下 SWAP_DENIED=1，并把这台机器当容器小鸡处理。
+swap_probe() {
+  [ -z "${SWAP_PROBED:-}" ] || return 0
+  SWAP_PROBED=1
+  SWAP_DENIED=
+  [ "$VIRT_KIND" != container ] || { SWAP_DENIED=1; return 0; }
+  # 已经开着我们的虚拟内存，说明允许。
+  grep -q "^$SWAP_FILE" /proc/swaps 2>/dev/null && return 0
+  if ! have swapon || ! have mkswap; then return 0; fi
+  pf=$SWAP_FILE.probe
+  rm -f "$pf"
+  : > "$pf" && chmod 600 "$pf"
+  chattr +C "$pf" 2>/dev/null || true
+  dd if=/dev/zero of="$pf" bs=1M count=1 2>/dev/null
+  if mkswap "$pf" >/dev/null 2>&1; then
+    if perr=$(swapon "$pf" 2>&1); then
+      swapoff "$pf" 2>/dev/null
+      rm -f "$pf"
+      return 0
+    fi
+    case "$perr" in
+      *ermitted*|*EPERM*|*ermission*)
+        SWAP_DENIED=1
+        VIRT_KIND=container
+        ROLE=小鸡
+        VIRT_DESC="$VIRT_DESC（系统不让开虚拟内存，按容器小鸡处理）"
+        ;;
+    esac
+  fi
+  rm -f "$pf"
+}
+
+# 现在还能用的内存（MB）。容器按 cgroup 的上限减去已用的算。
+mem_avail_mb() {
+  ma=$(( $(read_meminfo_kb MemAvailable:) / 1024 ))
+  if [ -r /sys/fs/cgroup/memory.max ] && [ -r /sys/fs/cgroup/memory.current ]; then
+    cmax=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
+    ccur=$(cat /sys/fs/cgroup/memory.current 2>/dev/null)
+    case "$cmax$ccur" in
+      *[!0-9]*|'') ;;
+      *) cfree=$(( (cmax - ccur) / 1024 / 1024 )); [ "$cfree" -lt "$ma" ] && ma=$cfree ;;
+    esac
+  fi
+  printf '%s' "$ma"
 }
 
 # 小内存：登录、下载时给 ipatool 限内存（Go 程序），网页服务也省着用。
@@ -564,22 +649,152 @@ drop_page_cache() {
   { echo 3 > /proc/sys/vm/drop_caches; } 2>/dev/null || true
 }
 
-make_swap() {
-  say_info "做一块 ${1}MB 的虚拟内存 $SWAP_FILE …"
-  if have fallocate && fallocate -l "${1}M" "$SWAP_FILE" 2>/dev/null; then
-    :
+# 已经有 /ipa-web.swap 就用 /ipa-web.swap.2、.3…，不去动正在用的那块（小内存机器 swapoff 可能腾不出地方）。
+next_swap_file() {
+  nf=$SWAP_FILE
+  n=1
+  while [ -e "$nf" ]; do
+    n=$((n + 1))
+    nf=$SWAP_FILE.$n
+  done
+  printf '%s' "$nf"
+}
+
+# 装过的所有虚拟内存文件
+swap_files() {
+  for f in "$SWAP_FILE" "$SWAP_FILE".*; do
+    [ -f "$f" ] && printf '%s\n' "$f"
+  done
+}
+
+# swap_file_try 文件 大小 方式：用 fallocate 或 dd 做好并打开。
+swap_file_try() {
+  rm -f "$1"
+  : > "$1" || return 1
+  chmod 600 "$1"
+  # Btrfs 上的虚拟内存文件必须关掉写时复制，别的文件系统这句会失败，不要紧。
+  chattr +C "$1" 2>/dev/null || true
+  if [ "$3" = fallocate ]; then
+    have fallocate && fallocate -l "${2}M" "$1" 2>/dev/null || { rm -f "$1"; return 1; }
   else
-    dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$1" 2>/dev/null || { rm -f "$SWAP_FILE"; return 1; }
+    dd if=/dev/zero of="$1" bs=1M count="$2" 2>/dev/null || { rm -f "$1"; return 1; }
   fi
-  chmod 600 "$SWAP_FILE"
-  if mkswap "$SWAP_FILE" >/dev/null 2>&1 && swapon "$SWAP_FILE" 2>/dev/null; then
-    grep -q "^$SWAP_FILE " /etc/fstab 2>/dev/null || echo "$SWAP_FILE none swap sw 0 0" >> /etc/fstab
-    say_ok "虚拟内存开好了，重启后也会自动开"
+  if mkswap "$1" >/dev/null 2>&1 && swapon "$1" 2>/dev/null; then
     return 0
   fi
-  rm -f "$SWAP_FILE"
-  say_warn "这台机器不让开虚拟内存，跳过"
+  rm -f "$1"
   return 1
+}
+
+# 硬盘不够或者文件做的虚拟内存开不了时，试试 zram（在内存里压缩，64MB 的机器大概能多出一倍）。
+ZRAM_FLAG=$BASE/zram
+zram_on() {
+  [ -b /dev/zram0 ] || modprobe zram num_devices=1 2>/dev/null || return 1
+  [ -b /dev/zram0 ] || return 1
+  grep -q '^/dev/zram0 ' /proc/swaps 2>/dev/null && return 0
+  echo 1 > /sys/block/zram0/reset 2>/dev/null
+  for alg in lz4 lzo-rle lzo zstd; do
+    echo "$alg" > /sys/block/zram0/comp_algorithm 2>/dev/null && break
+  done
+  echo "${1}M" > /sys/block/zram0/disksize 2>/dev/null || return 1
+  mkswap /dev/zram0 >/dev/null 2>&1 && swapon -p 100 /dev/zram0 2>/dev/null
+}
+
+# make_swap 大小：加一块虚拟内存。成功返回 0。
+make_swap() {
+  sf=$(next_swap_file)
+  say_info "做一块 ${1}MB 的虚拟内存 $sf …"
+  if swap_file_try "$sf" "$1" fallocate || swap_file_try "$sf" "$1" dd; then
+    grep -q "^$sf " /etc/fstab 2>/dev/null || echo "$sf none swap sw 0 0" >> /etc/fstab
+    # Alpine（OpenRC）要打开 swap 服务，开机才会读 fstab 里的虚拟内存。
+    [ "$INIT" = openrc ] && rc-update add swap boot >/dev/null 2>&1
+    SWAP_MB=$((SWAP_MB + $1))
+    say_ok "虚拟内存开好了（现在共 ${SWAP_MB}MB），重启后也会自动开"
+    return 0
+  fi
+  say_warn "硬盘做的虚拟内存开不了"
+  return 1
+}
+
+# make_zram：硬盘那条路走不通时的后备，大小是内存的 2 倍。
+make_zram() {
+  zs=$((MEM_MB * 2))
+  [ "$zs" -ge 64 ] || zs=64
+  say_info "改用 zram（在内存里压缩出 ${zs}MB 虚拟内存）…"
+  if zram_on "$zs"; then
+    mkdir -p "$BASE" && printf '%s\n' "$zs" > "$ZRAM_FLAG"
+    SWAP_MB=$((SWAP_MB + zs))
+    say_ok "zram 开好了，网页服务启动时会自动再开"
+    return 0
+  fi
+  say_warn "这台机器也开不了 zram"
+  return 1
+}
+
+# 已经开着的虚拟内存够不够、要不要加，打印一句给人看。
+swap_report() {
+  sr_plan=$(swap_plan_mb)
+  if [ "$VIRT_KIND" = container ]; then
+    say_info "容器小鸡（${VIRT_DESC}）自己加不了虚拟内存，现在内存 ${MEM_MB}MB + 虚拟内存 ${SWAP_MB}MB。"
+  elif [ "$sr_plan" -gt 0 ]; then
+    say_info "内存 ${MEM_MB}MB + 虚拟内存 ${SWAP_MB}MB，硬盘剩 ${DISK_MB}MB：自动加 ${sr_plan}MB 虚拟内存。"
+  elif need_swap; then
+    say_info "内存 ${MEM_MB}MB + 虚拟内存 ${SWAP_MB}MB，硬盘剩 ${DISK_MB}MB：硬盘不够做虚拟内存，会试试 zram。"
+  else
+    say_ok "内存 ${MEM_MB}MB + 虚拟内存 ${SWAP_MB}MB，够用了"
+  fi
+}
+
+# auto_swap：按机器配置自动开虚拟内存，不用回答问题。够用返回 0，开不出来返回 1。
+auto_swap() {
+  [ -n "${MEM_MB:-}" ] || detect_os
+  [ -n "${VIRT_KIND:-}" ] || detect_virt
+  swap_probe
+  [ "${IPAWEB_SWAP_MB:-}" != 0 ] || return 0
+  # zram 重启后就没了，标记过的再开一次。
+  if [ -f "$ZRAM_FLAG" ] && ! grep -q '^/dev/zram0 ' /proc/swaps 2>/dev/null; then
+    zram_on "$(cat "$ZRAM_FLAG")" && SWAP_MB=$(( $(read_meminfo_kb SwapTotal:) / 1024 ))
+  fi
+  as_plan=$(swap_plan_mb)
+  if [ "$as_plan" -gt 0 ]; then
+    make_swap "$as_plan" && return 0
+  fi
+  need_swap || return 0
+  [ "$VIRT_KIND" != container ] || return 1
+  grep -q '^/dev/zram0 ' /proc/swaps 2>/dev/null && return 0
+  make_zram
+}
+
+# 登录被系统杀掉以后：再挤一块虚拟内存出来。加上了返回 0，可以马上重试。
+grow_swap_after_oom() {
+  [ -n "${VIRT_KIND:-}" ] || detect_virt
+  swap_probe
+  [ "$VIRT_KIND" != container ] || return 1
+  [ "${IPAWEB_SWAP_MB:-}" != 0 ] || return 1
+  DISK_MB=$(disk_free_mb /)
+  SWAP_MB=$(( $(read_meminfo_kb SwapTotal:) / 1024 ))
+  # 目标翻倍，硬盘够就再加一块；不够就试 zram。
+  go_old=$SWAP_TARGET_MB
+  SWAP_TARGET_MB=$((MEM_MB + SWAP_MB + 512))
+  go_plan=$(swap_plan_mb)
+  SWAP_TARGET_MB=$go_old
+  if [ "$go_plan" -gt 0 ] && make_swap "$go_plan"; then return 0; fi
+  [ -z "${SWAP_DENIED:-}" ] || return 1
+  grep -q '^/dev/zram0 ' /proc/swaps 2>/dev/null && return 1
+  make_zram
+}
+
+# 卸载时删掉加过的虚拟内存
+remove_swap() {
+  swap_files | while IFS= read -r f; do
+    swapoff "$f" 2>/dev/null
+    rm -f "$f"
+    sed -i "\#^$f #d" /etc/fstab 2>/dev/null
+  done
+  if [ -f "$ZRAM_FLAG" ]; then
+    swapoff /dev/zram0 2>/dev/null
+    echo 1 > /sys/block/zram0/reset 2>/dev/null
+  fi
 }
 
 #----------------------------------------------------------------------
@@ -908,7 +1123,7 @@ def ipatool(args, timeout=120, home=None):
     env = dict(os.environ, HOME=home or CFG["home_dir"])
     if CFG["low_memory"]:
         # 小内存机器：让 ipatool（Go 程序）勤快点回收内存。
-        env.update(GOMEMLIMIT="40MiB", GOGC="50")
+        env.update(GOMEMLIMIT="32MiB", GOGC="25", GOMAXPROCS="1")
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
     try:
         out, _ = p.communicate(timeout=timeout)
@@ -1828,6 +2043,8 @@ EOF
 write_run_scripts() {
   cat > "$BASE/run.sh" <<EOF
 #!/bin/sh
+# zram 重启后就没了，开网页之前先把它开回来。
+[ -f $ZRAM_FLAG ] && ! grep -q '^/dev/zram0 ' /proc/swaps 2>/dev/null && $CMD_LINK --swap-boot >/dev/null 2>&1
 exec python3 $BASE/app/server.py $CONF
 EOF
   chmod 755 "$BASE/run.sh"
@@ -2045,8 +2262,8 @@ ipatool_run() {
   [ -n "$h" ] || h=$(cfg_get home_dir)
   [ -n "$h" ] || h=$BASE/home
   if low_mem; then
-    # Go 程序的内存回收设紧一点，实测登录峰值能少 20MB 左右。
-    GOMEMLIMIT=40MiB GOGC=50 HOME="$h" "$BASE/bin/ipatool" "$@" --format json --non-interactive \
+    # Go 程序的内存回收设紧一点、只用一个线程，登录峰值能少一截。
+    GOMEMLIMIT=32MiB GOGC=25 GOMAXPROCS=1 HOME="$h" "$BASE/bin/ipatool" "$@" --format json --non-interactive \
       --keychain-passphrase "$(cfg_get keychain_passphrase)" 2>&1
   else
     HOME="$h" "$BASE/bin/ipatool" "$@" --format json --non-interactive \
@@ -2182,7 +2399,7 @@ explain_login_error() {
     *[Ii]ncorrect*|*[Ii]nvalid*credential*|*password*) say_err "Apple ID 或密码不对" ;;
     *验证码*) say_err "$1，再登录一次重试" ;;
     *disabled*|*locked*) say_err "这个 Apple ID 被苹果锁住或停用了（也可能是账号/密码打错）。去 iforgot.apple.com 看看" ;;
-    *[Kk]illed*|*memory*) say_err "内存不够，ipatool 被系统杀掉了。先停掉别的程序或者加虚拟内存再试" ;;
+    *[Kk]illed*|*memory*) say_err "内存不够，ipatool 被系统杀掉了" ;;
     *timeout*|*connection*|*dial*) say_err "连不上苹果服务器，检查一下 VPS 网络" ;;
     *) say_err "登录失败：$1" ;;
   esac
@@ -2201,13 +2418,20 @@ apple_login() {
   if [ ! -d "$BASE/cache/ipatool" ] && [ ! -d "$ACCT_HOME/.cache/ipatool" ]; then
     say_info "第一次登录 ipatool 要先准备一些文件，可能要等一两分钟。"
   fi
+  # 从 qiequ / --login 进来时还没看过机器，先看一眼，虚拟内存不够就自动补上。
+  [ -n "${MEM_MB:-}" ] || detect_os
+  need_swap && auto_swap
   PAUSED_WEB=
   if low_mem && web_alive; then
     say_info "内存小，登录时先暂停网页服务腾内存，登录完自动恢复。"
     svc_stop "$SVC" "$BASE/run.sh"
+    [ -x "$BASE/run-caddy.sh" ] && svc_stop "$SVC_CADDY" "$BASE/run-caddy.sh"
     PAUSED_WEB=1
   fi
-  low_mem && drop_page_cache
+  if low_mem; then
+    drop_page_cache
+    say_info "现在能用的内存 $(mem_avail_mb)MB + 虚拟内存 $(( $(read_meminfo_kb SwapFree:) / 1024 ))MB"
+  fi
   apple_login_loop "$2"
   rc_login=$?
   if [ -n "$PAUSED_WEB" ]; then
@@ -2281,6 +2505,19 @@ apple_login_loop() {
     fi
     [ $rc -eq 137 ] && err=Killed
     explain_login_error "$err"
+    case "$err" in
+      *[Kk]illed*|*memory*)
+        if grow_swap_after_oom; then
+          drop_page_cache
+          say_info "虚拟内存加上了，重新登录一次（密码要再输一遍）"
+          continue
+        fi
+        if [ "$VIRT_KIND" = container ]; then
+          say_warn "这是容器小鸡（${VIRT_DESC}），系统不让加虚拟内存，可用内存只有 $(mem_avail_mb)MB。"
+          say_warn "ipatool 登录 Apple ID 要 110MB 以上，这台只能找商家加内存，或者换一台 KVM 小鸡。"
+        fi
+        ;;
+    esac
     ask_yn "再试一次吗？" y || return 1
   done
   return 1
@@ -2629,30 +2866,19 @@ ask_questions() {
     say_warn "1 到 9"
   done
 
-  # 7. 小内存
+  # 7. 虚拟内存：按机器配置自动算，不问。IPAWEB_SWAP_MB=0 可以关掉。
   Q_SWAP=0
-  if need_swap; then
-    sw=$(swap_size_for_disk)
-    if [ "$VIRT_KIND" = container ]; then
-      if [ $((MEM_MB + SWAP_MB)) -lt 200 ]; then
-        say_warn "内存只有 ${MEM_MB}MB（虚拟内存 ${SWAP_MB}MB），又是容器小鸡，自己加不了虚拟内存。"
-        say_warn "ipatool 登录 Apple ID 时实测要 110~180MB，这台大概率登录不上（会被系统杀掉）。"
-        say_warn "网页能装，但建议换一台 KVM 小鸡（64MB 的 KVM 加虚拟内存就能用）。"
-        ask_yn "还要继续装吗？" n || exit 0
-      else
-        say_info "内存 ${MEM_MB}MB 有点紧。登录 Apple ID 前脚本会先暂停网页服务腾内存。"
-      fi
-    elif [ "$sw" -gt 0 ]; then
-      say_info "内存 ${MEM_MB}MB 偏小。ipatool 登录时要 110~180MB，加一块 ${sw}MB 虚拟内存（占 ${sw}MB 硬盘）就不会被系统杀掉。"
-      if [ $((MEM_MB + SWAP_MB)) -lt 200 ]; then
-        say_warn "这台不加虚拟内存基本登录不上，强烈建议加。"
-      fi
-      if ask_yn "加 ${sw}MB 虚拟内存吗？" y; then
-        Q_SWAP=$sw
-      fi
-    else
-      say_warn "内存小、硬盘也小（${DISK_MB}MB），加不了虚拟内存，登录 Apple ID 可能会失败。"
-    fi
+  if [ "$VIRT_KIND" = container ] && [ $((MEM_MB + SWAP_MB)) -lt 200 ]; then
+    say_warn "内存只有 ${MEM_MB}MB（虚拟内存 ${SWAP_MB}MB），又是容器小鸡，自己加不了虚拟内存。"
+    say_warn "ipatool 登录 Apple ID 时实测要 110~180MB，这台大概率登录不上（会被系统杀掉）。"
+    say_warn "网页能装，但建议换一台 KVM 小鸡（64MB 的 KVM 加虚拟内存就能用）。"
+    ask_yn "还要继续装吗？" n || exit 0
+  elif [ "${IPAWEB_SWAP_MB:-}" = 0 ]; then
+    say_info "IPAWEB_SWAP_MB=0：不加虚拟内存"
+  else
+    swap_report
+    Q_SWAP=$(swap_plan_mb)
+    [ "$Q_SWAP" -gt 0 ] || ! need_swap || [ "$VIRT_KIND" = container ] || Q_SWAP=zram
   fi
 
   # 8. 确认
@@ -2662,7 +2888,11 @@ ask_questions() {
   printf '  网页密码：%s\n' "$Q_PASSWORD"
   printf '  App Store 地区：%s\n' "$(printf '%s' "$Q_COUNTRY" | tr 'a-z' 'A-Z')"
   printf '  文件保留：%s 分钟　同时下载：%s 个\n' "$Q_RETENTION" "$Q_CONCURRENT"
-  [ "$Q_SWAP" -gt 0 ] && printf '  加虚拟内存：%s MB\n' "$Q_SWAP"
+  case "$Q_SWAP" in
+    0) ;;
+    zram) printf '  加虚拟内存：zram（硬盘不够，在内存里压缩）\n' ;;
+    *) printf '  加虚拟内存：%s MB（按机器配置自动算的）\n' "$Q_SWAP" ;;
+  esac
   printf '  安装到：%s\n' "$BASE"
   ask_yn "开始安装？" y || { say_info "没装，什么都没改。"; exit 0; }
 }
@@ -2709,12 +2939,16 @@ fresh_install() {
   [ "$PM" != none ] || say_warn "认不出这台机器用什么装软件，缺东西时请自己装"
   ensure_basic_tools
   detect_virt
+  swap_probe
   detect_net
   print_machine_report
   check_machine
   ask_questions
 
-  [ "$Q_SWAP" -gt 0 ] && make_swap "$Q_SWAP"
+  if [ "$Q_SWAP" != 0 ]; then
+    say_step "开虚拟内存"
+    auto_swap || say_warn "虚拟内存没开出来，登录 Apple ID 可能会被系统杀掉"
+  fi
   install_deps
   install_ipatool
   say_step "安装网页"
@@ -2840,6 +3074,22 @@ do_login() {
   if [ -n "$act" ]; then acct_relogin "$act"; else acct_add; fi
 }
 
+# ipa-web --swap：看看机器，按配置自动把虚拟内存开够。
+do_swap() {
+  detect_os
+  detect_virt
+  swap_probe
+  say_step "虚拟内存"
+  printf '  这是一台「%s」：%s\n' "$ROLE" "$VIRT_DESC"
+  printf '  内存：%s MB　虚拟内存：%s MB　硬盘剩余：%s MB\n' "$MEM_MB" "$SWAP_MB" "$DISK_MB"
+  swap_report
+  if auto_swap; then
+    awk 'NR>1 {printf "  %s  %d MB\n", $1, $3/1024}' /proc/swaps
+  else
+    say_warn "虚拟内存开不出来，登录 Apple ID 可能会被系统杀掉"
+  fi
+}
+
 do_log() {
   [ -f "$LOG" ] || die "还没有日志"
   tail -n "${1:-60}" "$LOG"
@@ -2858,6 +3108,8 @@ script_ok() {
 apply_update() {
   must_installed
   lock_take
+  detect_os
+  need_swap && auto_swap
   install_ipatool
   write_app_files
   write_run_scripts
@@ -2897,10 +3149,8 @@ do_uninstall() {
   svc_remove "$SVC" "$BASE/run.sh"
   svc_remove "$SVC_CADDY" "$BASE/run-caddy.sh"
   if [ -n "$dom" ]; then close_firewall 80 443; else close_firewall "$port"; fi
-  if [ -f "$SWAP_FILE" ] && ask_yn "要把安装时加的虚拟内存也删掉吗？" y; then
-    swapoff "$SWAP_FILE" 2>/dev/null
-    rm -f "$SWAP_FILE"
-    sed -i "\#^$SWAP_FILE #d" /etc/fstab 2>/dev/null
+  if { [ -n "$(swap_files)" ] || [ -f "$ZRAM_FLAG" ]; } && ask_yn "要把安装时加的虚拟内存也删掉吗？" y; then
+    remove_swap
   fi
   rm -rf "$BASE" "$LOG"
   rm -f "$CMD_LINK"
@@ -2926,6 +3176,7 @@ main_menu() {
     printf '  7) 更新脚本和 ipatool\n'
     printf '  8) 重新安装（重新回答所有问题，保留 Apple ID 登录）\n'
     printf '  9) 卸载\n'
+    printf '  s) 虚拟内存：重新检测，不够就自动加\n'
     printf '  0) 退出\n'
     ask "选哪个" "0"
     case "$ANSWER" in
@@ -2938,13 +3189,14 @@ main_menu() {
       7) do_upgrade ;;
       8) (fresh_install) ;;
       9) do_uninstall; exit 0 ;;
+      s|S) do_swap ;;
       *) exit 0 ;;
     esac
   done
 }
 
 usage() {
-  sed -n '2,31p' "$SELF" 2>/dev/null | sed 's/^#//'
+  sed -n '2,32p' "$SELF" 2>/dev/null | sed 's/^#//'
 }
 
 #----------------------------------------------------------------------
@@ -2967,6 +3219,8 @@ case "${1:-}" in
   --apply-update) need_root; apply_update ;;
   --uninstall) need_root; do_uninstall ;;
   --reinstall) fresh_install ;;
+  --swap) need_root; do_swap ;;
+  --swap-boot) need_root; detect_os; [ -f "$ZRAM_FLAG" ] && zram_on "$(cat "$ZRAM_FLAG")" ;;
   -h|--help) usage ;;
   "")
     need_root
