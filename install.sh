@@ -38,7 +38,7 @@
 #   HTTPS          加密的网址（https://），需要一个解析到 VPS 的域名
 #======================================================================
 
-VERSION=1.2.0
+VERSION=1.2.1
 # ipaweb-onekey-begin
 
 REPO=imthnio/vps-ipatool
@@ -49,7 +49,10 @@ CMD_LINK=/usr/local/bin/ipa-web
 QIEQU_LINK=/usr/local/bin/qiequ
 SVC=ipa-web
 SVC_CADDY=ipa-web-caddy
-IPATOOL_FALLBACK=2.7.0
+# ipatool 最低版本：2.8.0 恢复了 App Store 登录（本地生成 Anisette）。
+# 2.8.0 之前登录会在双重认证那步失败，苹果返回空响应 / HTTP 503。
+IPATOOL_MIN=2.8.0
+IPATOOL_FALLBACK=2.8.1
 CADDY_FALLBACK=2.10.2
 
 #----------------------------------------------------------------------
@@ -879,6 +882,16 @@ install_ipatool() {
     die "ipatool 跑不起来，可能是系统太老"
   fi
   say_ok "ipatool $(ipatool_version) 装好了"
+}
+
+# 登录前检查 ipatool 版本：太旧时登录必定失败（苹果不接受旧的验证方式，
+# 双重认证那步直接返回空响应 / HTTP 503），先升级再登录，免得白输密码和验证码。
+ensure_ipatool_min_version() {
+  have_ver=$(ipatool_version)
+  [ -n "$have_ver" ] || return 0
+  version_newer "$IPATOOL_MIN" "$have_ver" || return 0
+  say_warn "ipatool $have_ver 太旧，苹果已经不接受它的登录方式了，先升级到新版再登录。"
+  install_ipatool
 }
 
 #----------------------------------------------------------------------
@@ -2401,6 +2414,7 @@ explain_login_error() {
     *disabled*|*locked*) say_err "这个 Apple ID 被苹果锁住或停用了（也可能是账号/密码打错）。去 iforgot.apple.com 看看" ;;
     *[Kk]illed*|*memory*) say_err "内存不够，ipatool 被系统杀掉了" ;;
     *timeout*|*connection*|*dial*) say_err "连不上苹果服务器，检查一下 VPS 网络" ;;
+    *Store\ pod*|*no\ usable\ authentication\ response*|*non-plist*) say_err "苹果没返回可用的验证响应：ipatool 太旧，或者苹果又改了验证方式。运行 ipa-web --upgrade 升级 ipatool 再试" ;;
     *) say_err "登录失败：$1" ;;
   esac
 }
@@ -2432,6 +2446,7 @@ apple_login() {
     drop_page_cache
     say_info "现在能用的内存 $(mem_avail_mb)MB + 虚拟内存 $(( $(read_meminfo_kb SwapFree:) / 1024 ))MB"
   fi
+  ensure_ipatool_min_version
   apple_login_loop "$2"
   rc_login=$?
   if [ -n "$PAUSED_WEB" ]; then
