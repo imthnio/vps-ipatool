@@ -39,7 +39,7 @@
 #   HTTPS          加密的网址（https://），需要一个解析到 VPS 的域名
 #======================================================================
 
-VERSION=1.3.0
+VERSION=1.3.1
 # ipaweb-onekey-begin
 
 REPO=imthnio/vps-ipatool
@@ -143,7 +143,34 @@ need_root() {
 }
 
 # 同一时间只让一个本脚本在改东西。
+# 菜单等用户选的时候不拿锁，只有真正改东西的那一步才拿，用完就放，
+# 不然一个忘关的 qiequ 会一直挡住升级。
 LOCK_DIR=/run/ipa-web-install.lock
+
+proc_stat() {
+  # proc_stat 进程号：输出 "状态 父进程"，例如 "S 123"。读不到就输出空。
+  st=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+  [ -n "$st" ] || return 1
+  rest=${st##*) }
+  state=${rest%% *}
+  rest=${rest#* }
+  printf '%s %s' "$state" "${rest%% *}"
+}
+
+kill_quietly() {
+  # kill_quietly 进程号：先 TERM，等 3 秒，还活着就 KILL。僵尸不用等。
+  kill "$1" 2>/dev/null || return 0
+  i=0
+  while [ $i -lt 3 ]; do
+    kill -0 "$1" 2>/dev/null || return 0
+    st=$(proc_stat "$1")
+    [ "${st%% *}" = "Z" ] && return 0
+    sleep 1
+    i=$((i+1))
+  done
+  kill -9 "$1" 2>/dev/null || true
+}
+
 lock_take() {
   [ -d /run ] || LOCK_DIR=/tmp/ipa-web-install.lock
   if ! mkdir "$LOCK_DIR" 2>/dev/null; then
@@ -153,9 +180,37 @@ lock_take() {
       return 0
     fi
     if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
-      die "另一个 ipa-web 脚本正在运行（进程 $old），等它结束再来"
+      # 拿锁的进程还在：先看看是不是死剩下的。
+      st=$(proc_stat "$old")
+      state=${st%% *}
+      ppid=${st#* }
+      if [ "$state" = "Z" ]; then
+        # 僵尸：已经死了，只是没人收。kill -0 对僵尸也返回成功，
+        # 不特殊处理就会一直以为它还活着。
+        say_warn "拿锁的进程 $old 已经死了（僵尸进程），直接清理锁。"
+        rm -rf "$LOCK_DIR"
+      elif [ "$ppid" = "1" ]; then
+        # 孤儿：启动它的终端已经没了，没人能再跟它说话，
+        # 留着只会一直挡住别人。结束它，锁也一起清掉。
+        say_warn "拿锁的进程 $old 的终端已经断了，结束它并清理锁。"
+        kill_quietly "$old"
+        rm -rf "$LOCK_DIR"
+      else
+        # 真有人在用：告诉用户它在干什么，让用户决定要不要结束它。
+        cmd=$(tr '\0' ' ' < "/proc/$old/cmdline" 2>/dev/null)
+        [ -n "$cmd" ] || cmd=$(ps -o args= -p "$old" 2>/dev/null)
+        say_warn "另一个 ipa-web 脚本正在运行（进程 $old）。"
+        [ -n "$cmd" ] && say_warn "它在跑：$cmd"
+        if ask_yn "结束它并继续吗？（它正在做的事会被打断）" n; then
+          kill_quietly "$old"
+          rm -rf "$LOCK_DIR"
+        else
+          die "等它结束再来，或者先到那个终端里把它停掉。"
+        fi
+      fi
+    else
+      rm -rf "$LOCK_DIR"
     fi
-    rm -rf "$LOCK_DIR"
     mkdir "$LOCK_DIR" 2>/dev/null || die "建不了锁目录 $LOCK_DIR"
   fi
   echo $$ > "$LOCK_DIR/pid"
@@ -163,6 +218,17 @@ lock_take() {
   export IPAWEB_LOCK_OWNER
   trap 'restore_tty; rm -rf "$LOCK_DIR"' EXIT
   trap 'restore_tty; rm -rf "$LOCK_DIR"; printf "\n"; exit 130' INT TERM
+}
+
+lock_release() {
+  # 锁是自己拿的才放。放了以后退出时就不用再清一次，
+  # 不然可能把别人刚拿的锁误删掉。
+  [ "${IPAWEB_LOCK_OWNER:-}" = "$$" ] || return 0
+  rm -rf "$LOCK_DIR"
+  IPAWEB_LOCK_OWNER=
+  export IPAWEB_LOCK_OWNER
+  trap 'restore_tty' EXIT
+  trap 'restore_tty; printf "\n"; exit 130' INT TERM
 }
 
 #----------------------------------------------------------------------
@@ -2826,13 +2892,13 @@ qiequ_menu() {
     ask "选哪个" "0"
     case "$ANSWER" in
       0|q|Q|'') return 0 ;;
-      a|A) acct_add ;;
-      r|R) acct_pick "重新登录哪个" "$(acct_active_index)" && acct_relogin "$PICKED" ;;
-      d|D) acct_pick "删除哪个" "" && acct_delete "$PICKED" ;;
+      a|A) lock_take; acct_add; lock_release ;;
+      r|R) acct_pick "重新登录哪个" "$(acct_active_index)" && { lock_take; acct_relogin "$PICKED"; lock_release; } ;;
+      d|D) acct_pick "删除哪个" "" && { lock_take; acct_delete "$PICKED"; lock_release; } ;;
       *)
         id=$(acct_py find "$ANSWER" 2>/dev/null)
         if [ -n "$id" ]; then
-          acct_use "$id"
+          lock_take; acct_use "$id"; lock_release
           return 0
         fi
         say_warn "没有这个选项"
@@ -2843,17 +2909,17 @@ qiequ_menu() {
 
 qiequ_main() {
   must_installed
-  lock_take
-  acct_migrate
+  # 迁移旧账号要写东西，拿一下锁；菜单本身不等锁，选了要改东西的动作再拿。
+  lock_take; acct_migrate; lock_release
   case "${1:-}" in
     '') qiequ_menu ;;
     list|ls|-l) acct_print ;;
-    add|-a) acct_add ;;
+    add|-a) lock_take; acct_add; lock_release ;;
     -h|--help) sed -n '/^# 切区（/,/^# qiequ list/p' "$CMD_LINK" | sed 's/^#//' ;;
     *)
       id=$(acct_py find "$1" 2>/dev/null) || id=
       [ -n "$id" ] || { acct_print; die "没找到「$1」。可以写序号、地区代码或邮箱"; }
-      acct_use "$id"
+      lock_take; acct_use "$id"; lock_release
       ;;
   esac
 }
@@ -3188,13 +3254,15 @@ do_reset_password() {
 
 do_settings() {
   must_installed
-  lock_take
   ask_questions_settings
 }
 
 ask_questions_settings() {
   # 只改用户常改的几项，HTTPS 和端口改动需要重装服务的走重装流程。
   while :; do
+    # 上一轮万一没放掉锁（输入不对直接 continue 时），这里放掉，
+    # 等用户选的时候不占锁。
+    lock_release
     printf '\n%s\n' "${C_BOLD}改设置${C_NC}"
     printf '  1) 端口（现在 %s）\n' "$(cfg_get listen_port)"
     printf '  2) 当前账号的地区（现在 %s，切换账号请用 qiequ）\n' "$(cfg_get country | tr 'a-z' 'A-Z')"
@@ -3204,6 +3272,7 @@ ask_questions_settings() {
     printf '  5) ipatool 自动更新（现在 %s）\n' "$au_lbl"
     printf '  0) 返回\n'
     ask "选哪个" "0"
+    lock_take
     case "$ANSWER" in
       1)
         CUR_PORT=$(cfg_get listen_port)
@@ -3244,9 +3313,10 @@ ask_questions_settings() {
       5)
         if [ "$(cfg_get auto_update_ipatool)" = "false" ]; then cfg_set auto_update_ipatool true; else cfg_set auto_update_ipatool false; fi
         ;;
-      *) return 0 ;;
+      *) lock_release; return 0 ;;
     esac
     if restart_all; then say_ok "改好了，网页服务已重启"; else say_err "网页服务没起来，运行 ipa-web --log 看看"; fi
+    lock_release
   done
 }
 

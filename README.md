@@ -124,6 +124,9 @@ ipatool 会自动更新：网页服务运行时每天检查一次 GitHub，有�
 **登录时报「authentication request failed」「empty or non-plist」「HTTP 503」？**
 ipatool 太旧了。苹果改了 App Store 的验证方式，ipatool 2.8.0 之前的版本在双重认证那步登录不上（苹果直接返回空响应）。运行 `ipa-web --upgrade` 升级 ipatool 再登录；添加账号前脚本现在会自动检查版本，太旧会先升级。
 
+**提示「另一个 ipa-web 脚本正在运行」？**
+上次的 qiequ 或安装脚本还留在后台（比如网页终端断线后）。新版会自动清理死掉的进程占的锁；还活着的会问你一句要不要结束它。也可以手动清掉：`p=$(cat /run/ipa-web-install.lock/pid); kill $p; sleep 1; kill -9 $p 2>/dev/null; rm -rf /run/ipa-web-install.lock`。
+
 **网页打不开？**
 - 普通 VPS：检查云服务商的「安全组 / 防火墙」有没有放行端口。ufw、firewalld 脚本已经自动放行。
 - NAT 小鸡：检查商家面板里外网端口有没有映射到安装时填的内网端口。
