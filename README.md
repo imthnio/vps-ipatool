@@ -96,8 +96,11 @@ ipa-web --reset-password   换网页密码
 ipa-web --settings         改端口、地区、保留时间、同时下载数
 ipa-web --log              运行日志
 ipa-web --upgrade          更新脚本和 ipatool
+ipa-web --update-ipatool   只把 ipatool 更新到最新版
 ipa-web --uninstall        卸载
 ```
+
+ipatool 会自动更新：网页服务运行时每天检查一次 GitHub，有新版就在没人下载时自动换掉，不用手动管。可以在「改设置」里关掉自动更新，也可以随时运行 `ipa-web --update-ipatool` 手动更新。
 
 ## 网页能做什么
 

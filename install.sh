@@ -13,9 +13,10 @@
 #   sh install.sh --status           看看装得怎么样、网址是什么
 #   sh install.sh --login            重新登录正在用的 Apple ID（登录过期时用）
 #   sh install.sh --reset-password   换一把网页密码
-#   sh install.sh --settings         改端口、地区、保留时间、同时下载数
+#   sh install.sh --settings         改端口、地区、保留时间、同时下载数、自动更新
 #   sh install.sh --log              看最近的运行记录（排查问题用）
 #   sh install.sh --upgrade          更新本脚本和 ipatool
+#   sh install.sh --update-ipatool    只把 ipatool 更新到最新版（网页每天也会自动检查一次）
 #   sh install.sh --swap             按机器配置自动开虚拟内存（小内存机器登录被杀时用）
 #   sh install.sh --uninstall        卸载
 #   装好以后，以上命令都可以用 ipa-web 代替 sh install.sh，例如 ipa-web --status
@@ -38,7 +39,7 @@
 #   HTTPS          加密的网址（https://），需要一个解析到 VPS 的域名
 #======================================================================
 
-VERSION=1.2.1
+VERSION=1.3.0
 # ipaweb-onekey-begin
 
 REPO=imthnio/vps-ipatool
@@ -982,6 +983,7 @@ import hashlib
 import hmac
 import json
 import os
+import platform
 import re
 import secrets
 import shutil
@@ -989,6 +991,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import urllib.parse
@@ -996,7 +999,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
-VERSION = "1.1.0"
+VERSION = "1.3.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "config.json")
 
@@ -1015,6 +1018,7 @@ DEFAULTS = {
     "country": "cn",
     "retention_minutes": 60,
     "max_concurrent": 1,
+    "auto_update_ipatool": True,
     "apple_id": "",
     "trust_proxy": False,
     "low_memory": False,
@@ -1056,7 +1060,8 @@ def reload_config():
             log("重新读配置失败", e)
             return
         for k in ("home_dir", "country", "apple_id", "accounts", "active",
-                  "retention_minutes", "password_hash", "keychain_passphrase"):
+                  "retention_minutes", "password_hash", "keychain_passphrase",
+                  "auto_update_ipatool"):
             if k in new:
                 CFG[k] = new[k]
         CFG_STATE["mtime"] = m
@@ -1157,6 +1162,162 @@ def last_json(text):
             except ValueError:
                 continue
     return {}
+
+
+#----------------------------------------------------------------------
+# ipatool 自动更新：每天查一次 GitHub 有没有新版，有就在没人下载时换掉。
+# 换文件是原子操作，正在跑的 ipatool 不受影响；新文件先验校验、验版本，
+# 不行就恢复备份，不会把能用的旧版弄坏。关掉：在设置里关「ipatool 自动更新」。
+#----------------------------------------------------------------------
+IPATOOL_REPO = "majd/ipatool"
+IPATOOL_CHECK_INTERVAL = 86400  # 每天检查一次
+UPDATE_STATE = {"last_check": 0, "pending": None}
+
+
+def parse_version(s):
+    """'2.8.1' / 'v2.8.1' -> (2, 8, 1)，解析不出返回 None。"""
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", s or "")
+    if not m:
+        return None
+    return tuple(int(x) for x in m.groups())
+
+
+def fmt_version(v):
+    return ".".join(str(x) for x in v)
+
+
+def local_ipatool_version():
+    try:
+        p = subprocess.run([CFG["ipatool_bin"], "--version"],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=30)
+    except Exception:
+        return None
+    return parse_version(p.stdout.decode("utf-8", "replace"))
+
+
+def latest_ipatool_version():
+    req = urllib.request.Request(
+        "https://api.github.com/repos/%s/releases/latest" % IPATOOL_REPO,
+        headers={"User-Agent": "ipa-web", "Accept": "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            tag = json.load(r).get("tag_name", "")
+    except Exception as e:
+        log("查 ipatool 新版失败", e)
+        return None
+    return parse_version(tag)
+
+
+def jobs_active():
+    with JOBS_LOCK:
+        return any(j["status"] in ("queued", "running") for j in JOBS.values())
+
+
+def download_file(url, dest, timeout=120):
+    req = urllib.request.Request(url, headers={"User-Agent": "ipa-web"})
+    with urllib.request.urlopen(req, timeout=timeout) as r, open(dest, "wb") as f:
+        shutil.copyfileobj(r, f, 1024 * 256)
+
+
+def install_ipatool_version(ver):
+    """下载指定版本并换掉现在的 ipatool，成功返回 True。"""
+    machine = platform.machine()
+    arch = {"x86_64": "amd64", "amd64": "amd64",
+            "aarch64": "arm64", "arm64": "arm64"}.get(machine)
+    if not arch:
+        log("ipatool 自动更新：不支持的架构", machine)
+        return False
+    ver_s = fmt_version(ver)
+    base = os.path.dirname(HERE)  # /opt/ipa-web
+    tmp = os.path.join(base, "tmp", "ipatool-update")
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp, exist_ok=True)
+    name = "ipatool-%s-linux-%s.tar.gz" % (ver_s, arch)
+    url = "https://github.com/%s/releases/download/v%s/%s" % (IPATOOL_REPO, ver_s, name)
+    tgz = os.path.join(tmp, name)
+    try:
+        log("ipatool 自动更新：下载 %s" % name)
+        download_file(url, tgz)
+        want = None
+        try:
+            sha_path = tgz + ".sha256"
+            download_file(url + ".sha256sum", sha_path, timeout=30)
+            with open(sha_path, "r", encoding="utf-8") as f:
+                want = f.read().split()[0]
+        except Exception:
+            pass
+        if want:
+            h = hashlib.sha256()
+            with open(tgz, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 256), b""):
+                    h.update(chunk)
+            if h.hexdigest() != want:
+                log("ipatool 自动更新：文件校验不对，放弃")
+                return False
+        xtract = os.path.join(tmp, "x")
+        os.makedirs(xtract)
+        with tarfile.open(tgz, "r:gz") as t:
+            t.extractall(xtract)
+        cand = None
+        for root, _, files in os.walk(xtract):
+            for fn in files:
+                if fn.startswith("ipatool"):
+                    cand = os.path.join(root, fn)
+                    break
+            if cand:
+                break
+        if not cand:
+            log("ipatool 自动更新：压缩包里找不到 ipatool")
+            return False
+        os.chmod(cand, 0o755)
+        # 先确认新文件能跑、版本对，再换。
+        try:
+            p = subprocess.run([cand, "--version"], stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, timeout=30)
+            got = parse_version(p.stdout.decode("utf-8", "replace"))
+        except Exception:
+            got = None
+        if got != ver:
+            log("ipatool 自动更新：新文件版本不对（想要 %s）" % ver_s)
+            return False
+        bin_path = CFG["ipatool_bin"]
+        bak_path = bin_path + ".bak"
+        if os.path.exists(bin_path):
+            shutil.copy2(bin_path, bak_path)
+        os.replace(cand, bin_path)
+        if local_ipatool_version() != ver:
+            if os.path.exists(bak_path):
+                os.replace(bak_path, bin_path)
+            log("ipatool 自动更新：换上去的版本不对，已恢复旧版")
+            return False
+        log("ipatool 已自动更新到 %s" % ver_s)
+        return True
+    except Exception as e:
+        log("ipatool 自动更新失败", e)
+        return False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def maybe_update_ipatool(now):
+    """每天查一次新版，有新版且没人下载时就升级。失败了明天再试。"""
+    if not CFG.get("auto_update_ipatool", True):
+        return
+    if UPDATE_STATE["pending"] is None and now - UPDATE_STATE["last_check"] >= IPATOOL_CHECK_INTERVAL:
+        UPDATE_STATE["last_check"] = now
+        cur = local_ipatool_version()
+        latest = latest_ipatool_version()
+        if latest and (cur is None or latest > cur):
+            UPDATE_STATE["pending"] = latest
+            log("发现 ipatool 新版 %s（现在 %s），没人下载时自动升级"
+                % (fmt_version(latest), fmt_version(cur) if cur else "未安装"))
+    pending = UPDATE_STATE["pending"]
+    if pending is None or jobs_active():
+        return
+    # 装失败也先清掉，明天检查时再说，避免每分钟重试下载。
+    install_ipatool_version(pending)
+    UPDATE_STATE["pending"] = None
 
 
 def explain_error(text):
@@ -1356,6 +1517,7 @@ def cleaner():
                 shutil.rmtree(j["dir"], ignore_errors=True)
                 with JOBS_LOCK:
                     JOBS.pop(jid, None)
+        maybe_update_ipatool(now)
 
 
 #----------------------------------------------------------------------
@@ -1683,6 +1845,7 @@ def main():
     CFG["listen_host"] = host
     signal.signal(signal.SIGTERM, lambda *_: (srv.server_close(), sys.exit(0)))
     log("ipa-web %s 已启动，监听 %s:%s" % (VERSION, CFG["listen_host"], CFG["listen_port"]))
+    log("ipatool 自动更新：%s" % ("开（每天检查一次）" if CFG.get("auto_update_ipatool", True) else "关"))
     srv.serve_forever()
 
 
@@ -2732,7 +2895,8 @@ show_status() {
     acct_print
   fi
   printf '文件保留：%s 分钟　同时下载：%s 个\n' "$(cfg_get retention_minutes)" "$(cfg_get max_concurrent)"
-  printf 'ipatool：%s　脚本：%s\n' "$(ipatool_version)" "$VERSION"
+  if [ "$(cfg_get auto_update_ipatool)" = "false" ]; then au_st="关"; else au_st="开，每天检查"; fi
+  printf 'ipatool：%s（自动更新 %s）　脚本：%s\n' "$(ipatool_version)" "$au_st" "$VERSION"
   printf '程序目录：%s　日志：%s\n' "$BASE" "$LOG"
   if [ "$(cfg_get nat)" = 1 ]; then
     printf '%s\n' "${C_YELLOW}这是 NAT 小鸡：外网端口 $(cfg_get public_port) 要在商家面板里映射到内网端口 $(cfg_get listen_port)。${C_NC}"
@@ -3036,6 +3200,8 @@ ask_questions_settings() {
     printf '  2) 当前账号的地区（现在 %s，切换账号请用 qiequ）\n' "$(cfg_get country | tr 'a-z' 'A-Z')"
     printf '  3) 文件保留时间（现在 %s 分钟）\n' "$(cfg_get retention_minutes)"
     printf '  4) 同时下载数（现在 %s 个）\n' "$(cfg_get max_concurrent)"
+    if [ "$(cfg_get auto_update_ipatool)" = "false" ]; then au_lbl="关"; else au_lbl="开"; fi
+    printf '  5) ipatool 自动更新（现在 %s）\n' "$au_lbl"
     printf '  0) 返回\n'
     ask "选哪个" "0"
     case "$ANSWER" in
@@ -3074,6 +3240,9 @@ ask_questions_settings() {
       4)
         ask "同时下载数（1-9）" "$(cfg_get max_concurrent)"
         case "$ANSWER" in [1-9]) cfg_set max_concurrent "$ANSWER" ;; *) say_warn "1 到 9"; continue ;; esac
+        ;;
+      5)
+        if [ "$(cfg_get auto_update_ipatool)" = "false" ]; then cfg_set auto_update_ipatool true; else cfg_set auto_update_ipatool false; fi
         ;;
       *) return 0 ;;
     esac
@@ -3185,7 +3354,7 @@ main_menu() {
     printf '  1) 查看状态 / 网址\n'
     printf '  2) 切区 / 管理 Apple ID 账号（也可以直接运行 qiequ）\n'
     printf '  3) 修改网页密码\n'
-    printf '  4) 改设置（端口、地区、保留时间、同时下载数）\n'
+    printf '  4) 改设置（端口、地区、保留时间、同时下载数、自动更新）\n'
     printf '  5) 重启网页服务\n'
     printf '  6) 看运行日志\n'
     printf '  7) 更新脚本和 ipatool\n'
@@ -3231,6 +3400,7 @@ case "${1:-}" in
   --log) do_log "${2:-60}" ;;
   --restart) need_root; do_restart ;;
   --upgrade) need_root; do_upgrade ;;
+  --update-ipatool) need_root; lock_take; detect_os; install_ipatool ;;
   --apply-update) need_root; apply_update ;;
   --uninstall) need_root; do_uninstall ;;
   --reinstall) fresh_install ;;
