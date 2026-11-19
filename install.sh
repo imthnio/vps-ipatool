@@ -39,7 +39,7 @@
 #   HTTPS          加密的网址（https://），需要一个解析到 VPS 的域名
 #======================================================================
 
-VERSION=1.3.2
+VERSION=1.3.3
 # ipaweb-onekey-begin
 
 REPO=imthnio/vps-ipatool
@@ -54,6 +54,10 @@ SVC_CADDY=ipa-web-caddy
 # 2.8.0 之前登录会在双重认证那步失败，苹果返回空响应 / HTTP 503。
 IPATOOL_MIN=2.8.0
 IPATOOL_FALLBACK=2.8.1
+# 低内存机器（<=512MB）下载/查版本专用的轻量版 ipatool：
+# 2.8.x 每次下载会同时开多个 Unicorn 模拟器实例，峰值 330~370MB 内存，256MB 小鸡必被 OOM 杀掉；
+# 2.7.0 钥匙串与 2.8.x 完全兼容，下载/查版本仅需 ~50MB 内存。登录仍用新版 ipatool。
+IPATOOL_LOWMEM_VER=2.7.0
 CADDY_FALLBACK=2.10.2
 
 #----------------------------------------------------------------------
@@ -251,6 +255,23 @@ cgroup_mem_mb() {
   return 1
 }
 
+# 容器里的虚拟内存上限也可能被 cgroup 限制，比 /proc/meminfo 的 SwapTotal 准。
+cgroup_swap_mb() {
+  if [ -r /sys/fs/cgroup/memory.swap.max ]; then
+    cgv=$(tr -d ' \r\n' < /sys/fs/cgroup/memory.swap.max 2>/dev/null)
+    case "$cgv" in
+      ''|max|*[!0-9]*) ;;
+      *)
+        if [ "${#cgv}" -le 13 ]; then
+          printf '%s' $((cgv / 1024 / 1024))
+          return 0
+        fi
+        ;;
+    esac
+  fi
+  return 1
+}
+
 disk_free_mb() {
   df -Pk "$1" 2>/dev/null | awk 'NR==2 {print int($4/1024)}'
 }
@@ -292,6 +313,10 @@ detect_os() {
   # 测试时可以假装成小内存机器，例如 IPAWEB_MEM_MB=64 sh install.sh
   if [ -n "${IPAWEB_MEM_MB:-}" ]; then MEM_MB=$IPAWEB_MEM_MB; fi
   SWAP_MB=$(( $(read_meminfo_kb SwapTotal:) / 1024 ))
+  cgsw=$(cgroup_swap_mb 2>/dev/null || true)
+  if [ -n "$cgsw" ] && [ "$cgsw" -lt "$SWAP_MB" ]; then
+    SWAP_MB=$cgsw
+  fi
   DISK_MB=$(disk_free_mb /)
   [ -n "$DISK_MB" ] || DISK_MB=0
 }
@@ -907,6 +932,59 @@ ipatool_version() {
   "$BASE/bin/ipatool" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1
 }
 
+ipatool_dl_version() {
+  "$BASE/bin/ipatool-dl" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1
+}
+
+# download_ipatool_bin 版本 目标路径：下载并校验指定版本的 ipatool 到目标路径。
+download_ipatool_bin() {
+  dl_ver=$1
+  dl_dest=$2
+  mkdir -p "$BASE/bin" "$BASE/tmp"
+  dl_name="ipatool-$dl_ver-linux-$ARCH.tar.gz"
+  dl_url="https://github.com/majd/ipatool/releases/download/v$dl_ver/$dl_name"
+  dl_tgz="$BASE/tmp/$dl_name"
+  say_info "下载 $dl_name …"
+  gh_download "$dl_url" "$dl_tgz" || return 1
+  if gh_download "$dl_url.sha256sum" "$dl_tgz.sha256" && have sha256sum; then
+    want=$(awk '{print $1; exit}' "$dl_tgz.sha256")
+    got=$(sha256sum "$dl_tgz" | awk '{print $1}')
+    if [ "$want" != "$got" ]; then
+      rm -f "$dl_tgz" "$dl_tgz.sha256"
+      say_err "ipatool $dl_ver 下载不完整（校验不对）"
+      return 1
+    fi
+    say_ok "文件校验通过"
+  else
+    say_warn "拿不到校验文件，跳过校验"
+  fi
+  rm -rf "$BASE/tmp/x"
+  mkdir -p "$BASE/tmp/x"
+  tar -xzf "$dl_tgz" -C "$BASE/tmp/x" || { rm -rf "$BASE/tmp/x" "$dl_tgz" "$dl_tgz.sha256"; return 1; }
+  dl_bin=$(find "$BASE/tmp/x" -type f -name 'ipatool*' | head -n 1)
+  [ -n "$dl_bin" ] || { rm -rf "$BASE/tmp/x" "$dl_tgz" "$dl_tgz.sha256"; return 1; }
+  chmod 755 "$dl_bin"
+  mv -f "$dl_bin" "$dl_dest"
+  rm -rf "$BASE/tmp/x" "$dl_tgz" "$dl_tgz.sha256"
+  "$dl_dest" --version >/dev/null 2>&1
+}
+
+install_ipatool_dl() {
+  low_mem || return 0
+  have_dl=$(ipatool_dl_version)
+  if [ "$have_dl" = "$IPATOOL_LOWMEM_VER" ]; then
+    say_ok "低内存下载引擎 ipatool-dl $have_dl 已就绪"
+    return 0
+  fi
+  say_info "小内存机器（${MEM_MB}MB）：安装低内存下载引擎 ipatool $IPATOOL_LOWMEM_VER（下载仅占约 50MB 内存）…"
+  if download_ipatool_bin "$IPATOOL_LOWMEM_VER" "$BASE/bin/ipatool-dl"; then
+    say_ok "低内存下载引擎 ipatool-dl $(ipatool_dl_version) 装好了"
+  else
+    rm -f "$BASE/bin/ipatool-dl"
+    say_warn "低内存下载引擎安装失败，将回退使用新版 ipatool（可稍后运行 ipa-web --upgrade 重试）"
+  fi
+}
+
 install_ipatool() {
   say_step "安装 ipatool"
   case "$ARCH" in
@@ -921,37 +999,16 @@ install_ipatool() {
   have_ver=$(ipatool_version)
   if [ -n "$have_ver" ] && ! version_newer "$ver" "$have_ver"; then
     say_ok "ipatool $have_ver 已经是最新"
-    return 0
-  fi
-  mkdir -p "$BASE/bin" "$BASE/tmp"
-  name="ipatool-$ver-linux-$ARCH.tar.gz"
-  url="https://github.com/majd/ipatool/releases/download/v$ver/$name"
-  tgz="$BASE/tmp/$name"
-  say_info "下载 $name …"
-  gh_download "$url" "$tgz" || die "下载 ipatool 失败。国内机器可以设置加速镜像再试：IPAWEB_GH_PROXY=https://你的镜像/ sh install.sh"
-  if gh_download "$url.sha256sum" "$tgz.sha256" && have sha256sum; then
-    want=$(awk '{print $1; exit}' "$tgz.sha256")
-    got=$(sha256sum "$tgz" | awk '{print $1}')
-    [ "$want" = "$got" ] || { rm -f "$tgz" "$tgz.sha256"; die "ipatool 下载不完整（校验不对），再运行一次试试"; }
-    say_ok "文件校验通过"
   else
-    say_warn "拿不到校验文件，跳过校验"
-  fi
-  rm -rf "$BASE/tmp/x"
-  mkdir -p "$BASE/tmp/x"
-  tar -xzf "$tgz" -C "$BASE/tmp/x" || die "解压 ipatool 失败"
-  bin=$(find "$BASE/tmp/x" -type f -name 'ipatool*' | head -n 1)
-  [ -n "$bin" ] || die "压缩包里找不到 ipatool"
-  chmod 755 "$bin"
-  mv -f "$bin" "$BASE/bin/ipatool"
-  rm -rf "$BASE/tmp"
-  if ! "$BASE/bin/ipatool" --version >/dev/null 2>&1; then
-    if [ "$LIBC" = musl ]; then
-      die "ipatool 跑不起来：这是 musl 系统，装 gcompat 兼容层失败了。试试手动 apk add gcompat"
+    if ! download_ipatool_bin "$ver" "$BASE/bin/ipatool"; then
+      if [ "$LIBC" = musl ] && [ -x "$BASE/bin/ipatool" ]; then
+        die "ipatool 跑不起来：这是 musl 系统，装 gcompat 兼容层失败了。试试手动 apk add gcompat"
+      fi
+      die "下载或安装 ipatool 失败。国内机器可以设置加速镜像再试：IPAWEB_GH_PROXY=https://你的镜像/ sh install.sh"
     fi
-    die "ipatool 跑不起来，可能是系统太老"
+    say_ok "ipatool $(ipatool_version) 装好了"
   fi
-  say_ok "ipatool $(ipatool_version) 装好了"
+  install_ipatool_dl
 }
 
 # 登录前检查 ipatool 版本：太旧时登录必定失败（苹果不接受旧的验证方式，
@@ -1068,8 +1125,10 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
-VERSION = "1.3.0"
+VERSION = "1.3.3"
 HERE = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(HERE)  # /opt/ipa-web
+TMP_ROOT = os.path.join(BASE_DIR, "tmp")
 CONFIG_PATH = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "config.json")
 
 #----------------------------------------------------------------------
@@ -1082,6 +1141,7 @@ DEFAULTS = {
     "secret": "",
     "keychain_passphrase": "",
     "ipatool_bin": "/opt/ipa-web/bin/ipatool",
+    "ipatool_dl_bin": "",
     "home_dir": "/opt/ipa-web/home",
     "data_dir": "/opt/ipa-web/data",
     "country": "cn",
@@ -1130,7 +1190,7 @@ def reload_config():
             return
         for k in ("home_dir", "country", "apple_id", "accounts", "active",
                   "retention_minutes", "password_hash", "keychain_passphrase",
-                  "auto_update_ipatool"):
+                  "auto_update_ipatool", "low_memory", "ipatool_dl_bin"):
             if k in new:
                 CFG[k] = new[k]
         CFG_STATE["mtime"] = m
@@ -1200,25 +1260,44 @@ def login_failed(ip):
 #----------------------------------------------------------------------
 # 调 ipatool。每次都带上钥匙串口令、JSON 输出、非交互，
 # HOME 指到专用目录，登录凭证不会和系统里别的东西混在一起。
+# TMPDIR 指到硬盘（/opt/ipa-web/tmp），不走 /tmp：容器里 /tmp 常是 tmpfs（内存盘），
+# ipatool 临时解压七十多 MB 苹果组件到 /tmp 会直接吃掉内存和 swap，被杀后还会永久残留。
 #----------------------------------------------------------------------
-def ipatool(args, timeout=120, home=None):
-    cmd = [CFG["ipatool_bin"]] + args + [
+def pick_ipatool_bin(args, force_main=False):
+    if not force_main and CFG.get("low_memory"):
+        dl_bin = CFG.get("ipatool_dl_bin") or os.path.join(BASE_DIR, "bin", "ipatool-dl")
+        if dl_bin and os.path.isfile(dl_bin) and os.access(dl_bin, os.X_OK):
+            # server.py 只会调 download / list-versions / get-version-metadata / auth info，
+            # 这些命令用 2.7.0 轻量引擎仅占 ~50MB 内存，钥匙串与新版完全兼容。
+            if not args or args[0] != "auth" or (len(args) > 1 and args[1] == "info"):
+                return dl_bin
+    return CFG["ipatool_bin"]
+
+
+def ipatool(args, timeout=120, home=None, force_main=False):
+    bin_path = pick_ipatool_bin(args, force_main=force_main)
+    cmd = [bin_path] + args + [
         "--format", "json",
         "--non-interactive",
         "--keychain-passphrase", CFG["keychain_passphrase"],
     ]
-    env = dict(os.environ, HOME=home or CFG["home_dir"])
+    run_tmp = os.path.join(TMP_ROOT, "run-" + secrets.token_hex(6))
+    os.makedirs(run_tmp, exist_ok=True)
+    env = dict(os.environ, HOME=home or CFG["home_dir"], TMPDIR=run_tmp)
     if CFG["low_memory"]:
-        # 小内存机器：让 ipatool（Go 程序）勤快点回收内存。
-        env.update(GOMEMLIMIT="32MiB", GOGC="25", GOMAXPROCS="1")
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
+        # 小内存机器：让 Go 勤快点回收内存，同时限制 glibc/C 堆 arena 数量。
+        env.update(GOMEMLIMIT="32MiB", GOGC="25", GOMAXPROCS="1", MALLOC_ARENA_MAX="2")
     try:
-        out, _ = p.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        p.kill()
-        p.communicate()
-        return None, "ipatool 超时没有反应"
-    return p.returncode, out.decode("utf-8", "replace")
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
+        try:
+            out, _ = p.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.communicate()
+            return None, "ipatool 超时没有反应"
+        return p.returncode, out.decode("utf-8", "replace")
+    finally:
+        shutil.rmtree(run_tmp, ignore_errors=True)
 
 
 def last_json(text):
@@ -1396,8 +1475,8 @@ def explain_error(text, rc=None):
     """
     if rc is not None and rc < 0:
         if rc == -9:
-            return ("VPS 内存不够，ipatool 被系统杀掉了（OOM）。ipatool 下载时要约 220MB 内存，"
-                    "请在母鸡/商家面板把这台机器的内存调到 512MB 以上，或者把 ipa-web 装到内存大点的机器上。")
+            return ("VPS 内存不够，ipatool 被系统杀掉了（OOM）。"
+                    "请运行 ipa-web --upgrade 启用低内存下载引擎，或等其他任务结束再试。")
         return "ipatool 被系统信号 %d 强制结束了，没有留下错误信息（可能是内存不足，也可能是 ipatool 本身崩了）。" % -rc
     raw = last_json(text).get("error") or (text or "").strip()[-400:]
     if not raw:
@@ -1407,7 +1486,9 @@ def explain_error(text, rc=None):
     low = raw.lower()
     if "keyring" in low or "failed to get account" in low:
         return "VPS 上这个账号还没登录。请在 VPS 终端运行 qiequ，选 a 添加账号或 r 重新登录。"
-    if "token" in low and ("expire" in low or "invalid" in low):
+    if "store amd state is not provisioned" in low or "not provisioned" in low:
+        return "ipatool 升级后需要重新登录一次 Apple ID 以更新本地认证状态。请在 VPS 终端运行 qiequ，选 r 重新登录这个账号。"
+    if ("token" in low and ("expire" in low or "invalid" in low)) or "sign-in request failed" in low or "authentication request failed" in low:
         return "Apple ID 登录已过期。请在 VPS 终端运行 qiequ，选 r 重新登录这个账号。"
     if "password" in low and ("incorrect" in low or "invalid" in low):
         return "Apple ID 凭证失效，请在 VPS 上重新登录。"
@@ -1418,7 +1499,7 @@ def explain_error(text, rc=None):
     if "not found" in low or "no results" in low:
         return "App Store 找不到这个 App，可能是 Apple ID 所在地区没有上架。"
     if "killed" in low or "signal: killed" in low:
-        return "VPS 内存不够，ipatool 被系统杀掉了。可以加虚拟内存，或者等别的任务做完再试。"
+        return "VPS 内存不够，ipatool 被系统杀掉了。可以运行 ipa-web --upgrade 启用低内存下载引擎，或者等别的任务做完再试。"
     if "no space" in low:
         return "VPS 硬盘满了。"
     return raw
@@ -1521,7 +1602,16 @@ def run_job(job):
         if job.get("ext_ver"):
             args += ["--external-version-id", job["ext_ver"]]
         # 大 App 可能好几个 G，给足两个小时。
+        used_dl = pick_ipatool_bin(args) != CFG["ipatool_bin"]
         rc, out = ipatool(args, timeout=7200, home=job["home"])
+        # 低内存轻量引擎遇到已下架 App 等仅新版支持的场景，尝试回退新版；若新版被 OOM 杀掉则保留轻量引擎原错。
+        if rc != 0 and used_dl:
+            low_out = (out or "").lower()
+            if "no longer available" in low_out or "invalid response" in low_out:
+                log("轻量引擎未命中，尝试新版 ipatool 重试", job["app_id"], job["name"])
+                rc2, out2 = ipatool(args, timeout=7200, home=job["home"], force_main=True)
+                if rc2 == 0 or (rc2 is not None and rc2 > 0):
+                    rc, out = rc2, out2
         info = last_json(out)
         ipa = None
         if rc == 0:
@@ -1905,13 +1995,28 @@ class Server(ThreadingMixIn, HTTPServer):
         HTTPServer.server_bind(self)
 
 
+def cleanup_stale_tmp():
+    """清理上次被强杀后残留在硬盘临时目录和 /tmp(tmpfs) 里的 ipatool 临时文件。"""
+    os.makedirs(TMP_ROOT, exist_ok=True)
+    for name in os.listdir(TMP_ROOT):
+        if name.startswith("run-") or name.startswith("ipatool-"):
+            shutil.rmtree(os.path.join(TMP_ROOT, name), ignore_errors=True)
+    try:
+        for name in os.listdir("/tmp"):
+            if name.startswith("ipatool-"):
+                shutil.rmtree(os.path.join("/tmp", name), ignore_errors=True)
+    except OSError:
+        pass
+
+
 def main():
     if CFG["low_memory"]:
         # 每个连接一个线程，线程栈调小一点。
         threading.stack_size(512 * 1024)
-    # 上次没传完的文件，重启后任务列表已经没了，直接清掉。
+    # 上次没传完的文件和残留临时目录，重启后直接清掉，避免占硬盘或 tmpfs 内存。
     for name in os.listdir(CFG["data_dir"]):
         shutil.rmtree(os.path.join(CFG["data_dir"], name), ignore_errors=True)
+    cleanup_stale_tmp()
     threading.Thread(target=cleaner, daemon=True).start()
     host, port = CFG["listen_host"], int(CFG["listen_port"])
     try:
@@ -1926,6 +2031,8 @@ def main():
     CFG["listen_host"] = host
     signal.signal(signal.SIGTERM, lambda *_: (srv.server_close(), sys.exit(0)))
     log("ipa-web %s 已启动，监听 %s:%s" % (VERSION, CFG["listen_host"], CFG["listen_port"]))
+    if CFG["low_memory"] and pick_ipatool_bin(["download"]) != CFG["ipatool_bin"]:
+        log("低内存模式：下载与查版本使用轻量引擎 %s，临时目录 %s" % (pick_ipatool_bin(["download"]), TMP_ROOT))
     log("ipatool 自动更新：%s" % ("开（每天检查一次）" if CFG.get("auto_update_ipatool", True) else "关"))
     srv.serve_forever()
 
@@ -2518,14 +2625,24 @@ ipatool_run() {
   h=$ACCT_HOME
   [ -n "$h" ] || h=$(cfg_get home_dir)
   [ -n "$h" ] || h=$BASE/home
-  if low_mem; then
-    # Go 程序的内存回收设紧一点、只用一个线程，登录峰值能少一截。
-    GOMEMLIMIT=32MiB GOGC=25 GOMAXPROCS=1 HOME="$h" "$BASE/bin/ipatool" "$@" --format json --non-interactive \
-      --keychain-passphrase "$(cfg_get keychain_passphrase)" 2>&1
-  else
-    HOME="$h" "$BASE/bin/ipatool" "$@" --format json --non-interactive \
-      --keychain-passphrase "$(cfg_get keychain_passphrase)" 2>&1
+  bin=$BASE/bin/ipatool
+  if low_mem && [ -x "$BASE/bin/ipatool-dl" ] && [ "${1:-}" = "auth" ] && [ "${2:-}" = "info" ]; then
+    bin=$BASE/bin/ipatool-dl
   fi
+  rtmp="$BASE/tmp/run-$$-$(date +%s)"
+  mkdir -p "$rtmp"
+  if low_mem; then
+    # Go 程序的内存回收设紧一点、只用一个线程，TMPDIR 放到硬盘不占 /tmp(tmpfs) 内存。
+    TMPDIR="$rtmp" GOMEMLIMIT=32MiB GOGC=25 GOMAXPROCS=1 MALLOC_ARENA_MAX=2 HOME="$h" "$bin" "$@" --format json --non-interactive \
+      --keychain-passphrase "$(cfg_get keychain_passphrase)" 2>&1
+    rc_run=$?
+  else
+    TMPDIR="$rtmp" HOME="$h" "$bin" "$@" --format json --non-interactive \
+      --keychain-passphrase "$(cfg_get keychain_passphrase)" 2>&1
+    rc_run=$?
+  fi
+  rm -rf "$rtmp"
+  return $rc_run
 }
 
 # 账号列表的增删改查都交给 Python，config.json 不会被写坏。
@@ -2977,7 +3094,12 @@ show_status() {
   fi
   printf '文件保留：%s 分钟　同时下载：%s 个\n' "$(cfg_get retention_minutes)" "$(cfg_get max_concurrent)"
   if [ "$(cfg_get auto_update_ipatool)" = "false" ]; then au_st="关"; else au_st="开，每天检查"; fi
-  printf 'ipatool：%s（自动更新 %s）　脚本：%s\n' "$(ipatool_version)" "$au_st" "$VERSION"
+  dl_v=$(ipatool_dl_version)
+  if [ -n "$dl_v" ] && [ "$(cfg_get low_memory)" = "true" ]; then
+    printf 'ipatool：%s（自动更新 %s，低内存下载引擎 %s）　脚本：%s\n' "$(ipatool_version)" "$au_st" "$dl_v" "$VERSION"
+  else
+    printf 'ipatool：%s（自动更新 %s）　脚本：%s\n' "$(ipatool_version)" "$au_st" "$VERSION"
+  fi
   printf '程序目录：%s　日志：%s\n' "$BASE" "$LOG"
   if [ "$(cfg_get nat)" = 1 ]; then
     printf '%s\n' "${C_YELLOW}这是 NAT 小鸡：外网端口 $(cfg_get public_port) 要在商家面板里映射到内网端口 $(cfg_get listen_port)。${C_NC}"
@@ -3018,9 +3140,9 @@ check_machine() {
     say_warn "硬盘只剩 ${DISK_MB}MB。ipa 文件动辄几百 MB，硬盘太小大 App 会下不了。"
     ask_yn "还要继续吗？" n || exit 0
   fi
-  if [ "$MEM_MB" -lt 512 ]; then
-    say_warn "这台机器内存只有 ${MEM_MB}MB。ipatool 下载时要约 220MB 内存（它在模拟器里跑苹果的框架），"
-    say_warn "内存太小下载中途会被系统杀掉。建议用 512MB 以上内存的机器，或者下载时别跑别的服务。"
+  if [ "$MEM_MB" -le 512 ]; then
+    say_info "这台机器内存为 ${MEM_MB}MB：会自动启用低内存下载引擎（ipatool $IPATOOL_LOWMEM_VER，下载仅占约 50MB 内存），"
+    say_info "并将临时文件放到硬盘目录 $BASE/tmp，避免占满 /tmp 内存盘导致 OOM。"
   fi
   if [ "$ROLE" = 母鸡 ]; then
     say_warn "这是母鸡（${VIRT_DESC}）。在母鸡上也能装，不过一般建议装在小鸡里，"
@@ -3186,7 +3308,12 @@ write_config() {
     retention_minutes "$Q_RETENTION" max_concurrent "$Q_CONCURRENT" \
     ipatool_bin "$BASE/bin/ipatool" home_dir "$BASE/home" data_dir "$BASE/data" \
     public_ipv4 "$PUB4" public_ipv6 "$PUB6" nat "$NAT" script_version "$VERSION"
-  if low_mem; then cfg_set low_memory true; else cfg_set low_memory false; fi
+  if low_mem; then
+    cfg_set low_memory true
+    if [ -x "$BASE/bin/ipatool-dl" ]; then cfg_set ipatool_dl_bin "$BASE/bin/ipatool-dl"; else cfg_set ipatool_dl_bin ""; fi
+  else
+    cfg_set low_memory false ipatool_dl_bin ""
+  fi
   set_web_password "$Q_PASSWORD"
   # 重装时已经存了账号：home_dir / country 恢复成正在用的账号的。
   acct_migrate
@@ -3388,9 +3515,16 @@ apply_update() {
   write_run_scripts
   install_self "$SELF"
   acct_migrate
+  # 清理旧版在 /tmp(tmpfs) 残留的 ipatool 临时目录，释放被占用的内存/swap。
+  rm -rf /tmp/ipatool-* "$BASE/tmp/run-"* 2>/dev/null || true
   # 旧版装的时候 low_memory 可能判错了（例如 256MB 的机器），更新时按现在的
   # 机器情况重新判一次，不然配置里一直留着错的。
-  if low_mem; then cfg_set low_memory true; else cfg_set low_memory false; fi
+  if low_mem; then
+    cfg_set low_memory true
+    if [ -x "$BASE/bin/ipatool-dl" ]; then cfg_set ipatool_dl_bin "$BASE/bin/ipatool-dl"; else cfg_set ipatool_dl_bin ""; fi
+  else
+    cfg_set low_memory false ipatool_dl_bin ""
+  fi
   cfg_set script_version "$VERSION"
   if restart_all; then say_ok "更新好了（脚本 $VERSION，ipatool $(ipatool_version)）"; else say_err "更新后网页服务没起来，运行 ipa-web --log 看看"; fi
 }
