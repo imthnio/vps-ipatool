@@ -39,7 +39,7 @@
 #   HTTPS          加密的网址（https://），需要一个解析到 VPS 的域名
 #======================================================================
 
-VERSION=1.3.1
+VERSION=1.3.2
 # ipaweb-onekey-begin
 
 REPO=imthnio/vps-ipatool
@@ -709,9 +709,12 @@ mem_avail_mb() {
 }
 
 # 小内存：登录、下载时给 ipatool 限内存（Go 程序），网页服务也省着用。
-LOW_MEM_MB=256
+# ipatool 下载时要在模拟器里跑苹果的框架，实测一个 40MB 的应用就要约 220MB
+# 内存；256MB 的机器装了别的服务就很容易被 OOM 杀掉，所以 512MB 及以下都按
+# 小内存处理（以前只认 256MB 以下，256MB 的机器会被漏掉）。
+LOW_MEM_MB=512
 low_mem() {
-  [ "${MEM_MB:-1024}" -lt "$LOW_MEM_MB" ]
+  [ "${MEM_MB:-1024}" -le "$LOW_MEM_MB" ]
 }
 
 drop_page_cache() {
@@ -1386,9 +1389,21 @@ def maybe_update_ipatool(now):
     UPDATE_STATE["pending"] = None
 
 
-def explain_error(text):
-    """把 ipatool 的英文报错翻成人话。"""
-    raw = last_json(text).get("error") or (text or "").strip()[-400:] or "未知错误"
+def explain_error(text, rc=None):
+    """把 ipatool 的英文报错翻成人话。rc 是 ipatool 的退出码。
+    负数表示被信号杀掉：-9 基本就是内存不够被 OOM 杀掉，这时 ipatool
+    来不及输出任何东西，只看输出会误判成「未知错误」，所以要先看 rc。
+    """
+    if rc is not None and rc < 0:
+        if rc == -9:
+            return ("VPS 内存不够，ipatool 被系统杀掉了（OOM）。ipatool 下载时要约 220MB 内存，"
+                    "请在母鸡/商家面板把这台机器的内存调到 512MB 以上，或者把 ipa-web 装到内存大点的机器上。")
+        return "ipatool 被系统信号 %d 强制结束了，没有留下错误信息（可能是内存不足，也可能是 ipatool 本身崩了）。" % -rc
+    raw = last_json(text).get("error") or (text or "").strip()[-400:]
+    if not raw:
+        if rc is not None and rc != 0:
+            return "ipatool 退出了（退出码 %d），但没有留下错误信息。" % rc
+        return "未知错误"
     low = raw.lower()
     if "keyring" in low or "failed to get account" in low:
         return "VPS 上这个账号还没登录。请在 VPS 终端运行 qiequ，选 a 添加账号或 r 重新登录。"
@@ -1525,8 +1540,8 @@ def run_job(job):
             log("下载完成", job["app_id"], job["name"], job["file_size"], "字节")
         else:
             job["status"] = "error"
-            job["error"] = explain_error(out)
-            log("下载失败", job["app_id"], job["name"], (out or "").strip()[-500:])
+            job["error"] = explain_error(out, rc)
+            log("下载失败", job["app_id"], job["name"], "rc=%s" % rc, (out or "").strip()[-500:])
             shutil.rmtree(job["dir"], ignore_errors=True)
         job["finished"] = time.time()
 
@@ -1603,7 +1618,7 @@ def account_info(force=False):
         if rc == 0 and j.get("success", True):
             data = {"logged_in": True, "email": j.get("email", CFG["apple_id"]), "name": j.get("name", "")}
         else:
-            data = {"logged_in": False, "email": CFG["apple_id"], "error": explain_error(out)}
+            data = {"logged_in": False, "email": CFG["apple_id"], "error": explain_error(out, rc)}
         # 只缓存「已登录」：刚在 VPS 上登录完，网页马上就能看到。
         ACCOUNT.update(t=time.time() if data["logged_in"] else 0, data=data, home=home)
         return data
@@ -1793,7 +1808,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"error": "App ID 不对"}, 400)
         rc, out = ipatool(["list-versions", "-i", app_id], timeout=180)
         if rc != 0:
-            return self.send_json({"error": explain_error(out)}, 502)
+            return self.send_json({"error": explain_error(out, rc)}, 502)
         j = last_json(out)
         ids = j.get("externalVersionIdentifiers")
         if not isinstance(ids, list):
@@ -1810,7 +1825,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"error": "参数不对"}, 400)
         rc, out = ipatool(["get-version-metadata", "-i", app_id, "--external-version-id", ver], timeout=180)
         if rc != 0:
-            return self.send_json({"error": explain_error(out)}, 502)
+            return self.send_json({"error": explain_error(out, rc)}, 502)
         j = last_json(out)
         self.send_json({
             "display": j.get("displayVersion") or j.get("version") or "",
@@ -3003,6 +3018,10 @@ check_machine() {
     say_warn "硬盘只剩 ${DISK_MB}MB。ipa 文件动辄几百 MB，硬盘太小大 App 会下不了。"
     ask_yn "还要继续吗？" n || exit 0
   fi
+  if [ "$MEM_MB" -lt 512 ]; then
+    say_warn "这台机器内存只有 ${MEM_MB}MB。ipatool 下载时要约 220MB 内存（它在模拟器里跑苹果的框架），"
+    say_warn "内存太小下载中途会被系统杀掉。建议用 512MB 以上内存的机器，或者下载时别跑别的服务。"
+  fi
   if [ "$ROLE" = 母鸡 ]; then
     say_warn "这是母鸡（${VIRT_DESC}）。在母鸡上也能装，不过一般建议装在小鸡里，"
     say_warn "免得网页服务和母鸡上开小鸡的程序抢资源、或者把母鸡暴露在公网上。"
@@ -3369,6 +3388,9 @@ apply_update() {
   write_run_scripts
   install_self "$SELF"
   acct_migrate
+  # 旧版装的时候 low_memory 可能判错了（例如 256MB 的机器），更新时按现在的
+  # 机器情况重新判一次，不然配置里一直留着错的。
+  if low_mem; then cfg_set low_memory true; else cfg_set low_memory false; fi
   cfg_set script_version "$VERSION"
   if restart_all; then say_ok "更新好了（脚本 $VERSION，ipatool $(ipatool_version)）"; else say_err "更新后网页服务没起来，运行 ipa-web --log 看看"; fi
 }
