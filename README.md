@@ -1,6 +1,9 @@
-# ipatool 网页一键脚本：输入 App 名字，ipa 直接下到你的电脑
+# ipatool 网页一键脚本：浏览器里搜 App，IPA / APK 直接下到你的电脑
 
-在 VPS 上装一个小网页。浏览器打开，输入 App 名字（也可以粘 App Store 链接或 Bundle ID），点「下载 IPA」。VPS 用 [ipatool](https://github.com/majd/ipatool) 以你的 Apple ID 从 App Store 下好，再自动保存到你正在用的电脑。也能下历史版本。
+在 VPS 上装一个小网页。浏览器打开即可同时下载 **iOS (IPA)** 和 **Android (APK / XAPK / APKS)**：
+
+- **iOS (IPA)**：输入 App 名字（或粘贴 App Store 链接 / Bundle ID），点「下载 IPA」。VPS 用 [ipatool](https://github.com/majd/ipatool) 以你的 Apple ID 从 App Store 下好，再自动保存到你正在用的电脑。也能下历史版本。
+- **Android (APK / XAPK / APKS)**：**无需登录任何账号**，内置多源聚合引擎并支持 [EFF apkeep](https://github.com/EFForg/apkeep) 兜底。支持按 App 名字、包名（如 `com.tencent.mm`）、Google Play / APKPure / 华为应用市场 / 应用宝 / F-Droid 链接、GitHub 仓库（`owner/repo`）或 `.apk` / `.xapk` / `.apks` 直链搜索与下载，支持历史版本与多源自动回退。
 
 全程一问一答：自动认出系统、架构、**小鸡还是母鸡**、是不是 NAT，缺什么装什么，端口、密码、地区都会先问你。64MB 的 KVM 小鸡加上虚拟内存也能用。
 
@@ -106,11 +109,27 @@ ipatool 会自动更新：网页服务运行时每天检查一次 GitHub，有�
 
 ## 网页能做什么
 
-- 按名字搜索，或者直接粘 App Store 链接、App ID、Bundle ID
-- 免费 App 自动「领取」到你的 Apple ID 再下载；付费 App 需要这个账号买过
-- 历史版本：列出版本编号，可以查具体版本号再下载
-- 下载进度、排队；下好后自动保存到电脑，也可以手动点「保存到电脑」（支持断点续传）
-- 网页密码登录，输错 8 次锁 10 分钟
+- **iOS (IPA)**：
+  - 按名字搜索，或者直接粘 App Store 链接、App ID、Bundle ID
+  - 免费 App 自动「领取」到你的 Apple ID 再下载；付费 App 需要这个账号买过
+  - 历史版本：列出版本编号，可以查具体版本号再下载
+- **Android (APK / XAPK / APKS)**：
+  - **免登录**，顶部一键切到 `Android (APK)` 即可使用
+  - 内置 8 个下载源，默认「全部源自动聚合」，也可手动指定单源：
+    - **APKPure**（海外应用最全，支持 APK / XAPK 与历史版本）
+    - **Uptodown**（海外大库，支持 APK / XAPK 与历史版本）
+    - **Aptoide**（海外大库，官方 API v7）
+    - **华为应用市场 AppGallery**（国内/海外多区官方高速直链）
+    - **腾讯应用宝**（国内应用极全，官方直链）
+    - **Vivo 应用商店**（国内应用极全，官方直链）
+    - **F-Droid**（开源应用库，支持官方源 + 清华 TUNA 镜像自动回退与历史版本）
+    - **GitHub Releases**（开源安卓项目，支持搜关键词或直接粘贴仓库链接 / `owner/repo` 查历史 Release 附件）
+  - 支持直接粘贴 `.apk` / `.xapk` / `.apks` / `.apkm` 下载直链中转到 VPS 再保存
+  - 下载失败自动跨源回退，并自动安装开源的 `apkeep` 作为额外兜底
+  - 自动校验文件头（ZIP/APK 魔数），防止误下拦截网页
+- **通用**：
+  - 下载进度、排队；下好后自动保存到电脑，也可以手动点「保存到电脑」（支持断点续传）
+  - 网页密码登录，输错 8 次锁 10 分钟
 
 ## 常见问题
 

@@ -1,10 +1,14 @@
 #!/bin/sh
 #======================================================================
-# ipatool 网页一键脚本：浏览器里搜 App，ipa 直接下到你正在用的电脑
+# ipatool 网页一键脚本：浏览器里搜 App，IPA / APK 直接下到你正在用的电脑
 #----------------------------------------------------------------------
-# 在 Linux VPS 上装好一个小网页。浏览器打开它，输入 App 名字（或者粘 App Store 链接），
-# 点「下载 IPA」，VPS 用 ipatool 以你的 Apple ID 从 App Store 下好，
-# 再自动传到你正在用的电脑。也能下历史版本。
+# 在 Linux VPS 上装好一个小网页。浏览器打开它：
+#   - 苹果 iOS（IPA）：输入 App 名字（或粘 App Store 链接），VPS 用 ipatool
+#     以你的 Apple ID 从 App Store 下好 IPA，再自动传到你的电脑。也能下历史版本。
+#   - 安卓 Android（APK / XAPK / APKS）：不用登录任何账号，内置多源聚合引擎
+#     （APKPure、Uptodown、Aptoide、华为应用市场、应用宝、Vivo 应用商店、F-Droid、
+#     GitHub Releases）并配备 EFF 开源的 apkeep 下载引擎，支持搜名字、包名、
+#     商店链接、GitHub 仓库或直链，多源自动回退，也能查历史版本。
 #
 # 全程一问一答：自动认出系统、架构、是小鸡还是母鸡、是不是 NAT，
 # 缺什么装什么，端口、密码、地区都会先问你。
@@ -15,8 +19,8 @@
 #   sh install.sh --reset-password   换一把网页密码
 #   sh install.sh --settings         改端口、地区、保留时间、同时下载数、自动更新
 #   sh install.sh --log              看最近的运行记录（排查问题用）
-#   sh install.sh --upgrade          更新本脚本和 ipatool
-#   sh install.sh --update-ipatool    只把 ipatool 更新到最新版（网页每天也会自动检查一次）
+#   sh install.sh --upgrade          更新本脚本、ipatool 和 apkeep
+#   sh install.sh --update-ipatool   只把 ipatool 和 apkeep 更新到最新版（网页每天也会自动检查）
 #   sh install.sh --swap             按机器配置自动开虚拟内存（小内存机器登录被杀时用）
 #   sh install.sh --uninstall        卸载
 #   装好以后，以上命令都可以用 ipa-web 代替 sh install.sh，例如 ipa-web --status
@@ -32,6 +36,8 @@
 #   NAT 小鸡       没有自己独立的公网 IP，只能用商家映射给你的几个端口
 #   端口           网页地址里冒号后面的数字，例如 http://1.2.3.4:23456 里的 23456
 #   ipatool        真正去 App Store 下 ipa 的程序（github.com/majd/ipatool）
+#   apkeep         EFF 开源的安卓 APK 多源命令行下载器（github.com/EFForg/apkeep）
+#   XAPK / APKS    安卓的分包安装包（含主 APK + 架构/语言分包或 OBB 数据包）
 #   钥匙串         ipatool 把 Apple ID 登录凭证加密存在 VPS 上的地方
 #   切区           换成另一个地区的 Apple ID。每个地区的 App Store 能下的 App 不一样
 #   双重认证码     登录 Apple ID 时，你 iPhone / Mac 上弹出的 6 位数字
@@ -39,7 +45,7 @@
 #   HTTPS          加密的网址（https://），需要一个解析到 VPS 的域名
 #======================================================================
 
-VERSION=1.3.3
+VERSION=1.4.0
 # ipaweb-onekey-begin
 
 REPO=imthnio/vps-ipatool
@@ -58,6 +64,7 @@ IPATOOL_FALLBACK=2.8.1
 # 2.8.x 每次下载会同时开多个 Unicorn 模拟器实例，峰值 330~370MB 内存，256MB 小鸡必被 OOM 杀掉；
 # 2.7.0 钥匙串与 2.8.x 完全兼容，下载/查版本仅需 ~50MB 内存。登录仍用新版 ipatool。
 IPATOOL_LOWMEM_VER=2.7.0
+APKEEP_FALLBACK=1.1.0
 CADDY_FALLBACK=2.10.2
 
 #----------------------------------------------------------------------
@@ -936,6 +943,46 @@ ipatool_dl_version() {
   "$BASE/bin/ipatool-dl" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1
 }
 
+apkeep_version() {
+  "$BASE/bin/apkeep" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1
+}
+
+install_apkeep() {
+  case "$ARCH" in
+    amd64) ak_asset="apkeep-x86_64-unknown-linux-gnu" ;;
+    arm64) ak_asset="apkeep-aarch64-unknown-linux-gnu" ;;
+    *) return 0 ;;
+  esac
+  ak_ver=$(latest_tag EFForg/apkeep)
+  [ -n "$ak_ver" ] || ak_ver=$APKEEP_FALLBACK
+  have_ak=$(apkeep_version)
+  if [ -n "$have_ak" ] && ! version_newer "$ak_ver" "$have_ak"; then
+    say_ok "安卓下载引擎 apkeep $have_ak 已就绪"
+    return 0
+  fi
+  mkdir -p "$BASE/bin" "$BASE/tmp"
+  ak_tmp="$BASE/tmp/apkeep.new"
+  ak_ok=
+  for ak_url in \
+    "https://github.com/EFForg/apkeep/releases/download/$ak_ver/$ak_asset" \
+    "https://github.com/EFForg/apkeep/releases/download/v$ak_ver/$ak_asset"; do
+    if gh_download "$ak_url" "$ak_tmp"; then
+      chmod 755 "$ak_tmp"
+      if "$ak_tmp" --version >/dev/null 2>&1; then
+        mv -f "$ak_tmp" "$BASE/bin/apkeep"
+        ak_ok=1
+        break
+      fi
+    fi
+    rm -f "$ak_tmp"
+  done
+  if [ -n "$ak_ok" ]; then
+    say_ok "安卓下载引擎 apkeep $(apkeep_version) 装好了"
+  else
+    say_info "apkeep 未装上（将完全使用内置 Python 多源引擎下载 APK）"
+  fi
+}
+
 # download_ipatool_bin 版本 目标路径：下载并校验指定版本的 ipatool 到目标路径。
 download_ipatool_bin() {
   dl_ver=$1
@@ -1009,6 +1056,7 @@ install_ipatool() {
     say_ok "ipatool $(ipatool_version) 装好了"
   fi
   install_ipatool_dl
+  install_apkeep
 }
 
 # 登录前检查 ipatool 版本：太旧时登录必定失败（苹果不接受旧的验证方式，
@@ -1093,23 +1141,24 @@ write_app_files() {
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #======================================================================
-# IPA 网页下载器的后台程序：浏览器里搜 App，VPS 用 ipatool 下好 ipa，
-# 再把文件传到你正在用的电脑。只用 Python 自带的库，不用装任何东西。
+# IPA / APK 网页下载器的后台程序：
+#   - iOS (IPA)：浏览器里搜 App，VPS 用 ipatool 下好 ipa 再传到你的电脑。
+#   - Android (APK / XAPK / APKS)：免登录，内置多源聚合引擎（APKPure、Uptodown、
+#     Aptoide、华为应用市场、腾讯应用宝、Vivo 应用商店、F-Droid、GitHub Releases）
+#     并可调用 apkeep 兜底，支持直链、包名、关键词与历史版本。
+# 只用 Python 自带的库，不用装任何第三方 pip 包。
 #
 #   python3 server.py /opt/ipa-web/config.json
-#
-# 名词小词典
-#   ipatool      真正去 App Store 下 ipa 的命令行程序（github.com/majd/ipatool）
-#   钥匙串       ipatool 把 Apple ID 的登录凭证加密存在 VPS 上，口令写在配置文件里
-#   任务         点一次「下载」就是一个任务：排队 -> 下载中 -> 下好 / 出错
-#   保留时间     ipa 下好以后在 VPS 上放多久，过了就自动删掉，省硬盘
 #======================================================================
 
+import concurrent.futures
+import gzip
 import hashlib
 import hmac
 import json
 import os
 import platform
+import random
 import re
 import secrets
 import shutil
@@ -1120,12 +1169,14 @@ import sys
 import tarfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
-VERSION = "1.3.3"
+VERSION = "1.4.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 BASE_DIR = os.path.dirname(HERE)  # /opt/ipa-web
 TMP_ROOT = os.path.join(BASE_DIR, "tmp")
@@ -1142,6 +1193,7 @@ DEFAULTS = {
     "keychain_passphrase": "",
     "ipatool_bin": "/opt/ipa-web/bin/ipatool",
     "ipatool_dl_bin": "",
+    "apkeep_bin": "/opt/ipa-web/bin/apkeep",
     "home_dir": "/opt/ipa-web/home",
     "data_dir": "/opt/ipa-web/data",
     "country": "cn",
@@ -1190,7 +1242,7 @@ def reload_config():
             return
         for k in ("home_dir", "country", "apple_id", "accounts", "active",
                   "retention_minutes", "password_hash", "keychain_passphrase",
-                  "auto_update_ipatool", "low_memory", "ipatool_dl_bin"):
+                  "auto_update_ipatool", "low_memory", "ipatool_dl_bin", "apkeep_bin"):
             if k in new:
                 CFG[k] = new[k]
         CFG_STATE["mtime"] = m
@@ -1288,7 +1340,10 @@ def ipatool(args, timeout=120, home=None, force_main=False):
         # 小内存机器：让 Go 勤快点回收内存，同时限制 glibc/C 堆 arena 数量。
         env.update(GOMEMLIMIT="32MiB", GOGC="25", GOMAXPROCS="1", MALLOC_ARENA_MAX="2")
     try:
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
+        except OSError as e:
+            return 127, "ipatool 不可用：%s" % e
         try:
             out, _ = p.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -1551,7 +1606,1271 @@ def search_apps(term, limit=20):
 
 
 #----------------------------------------------------------------------
-# 下载任务。同时只跑 max_concurrent 个 ipatool，小内存机器默认 1 个，其余排队。
+# 安卓 APK / XAPK / APKS 多源搜索与下载引擎（纯 Python 标准库，免登录）
+#   聚合来源：
+#     apkpure  - APKPure 移动端 API（海外应用最全，支持历史版本、APK/XAPK）
+#     uptodown - Uptodown 移动端 eAPI（海外大库，支持历史版本、APK/XAPK）
+#     aptoide  - Aptoide API v7（海外大库，直链稳定）
+#     huawei   - 华为应用市场 AppGallery（国内+海外多区，高速官方直链）
+#     tencent  - 腾讯应用宝（国内应用极全，官方直链）
+#     vivo     - Vivo 应用商店（国内应用极全，官方直链）
+#     fdroid   - F-Droid（开源应用库，支持官方+清华镜像回退与历史版本）
+#     github   - GitHub Releases（开源安卓项目，支持仓库链接与历史版本）
+#   另外支持直接粘贴 .apk/.xapk/.apks 直链，以及可选 apkeep CLI 兜底。
+#----------------------------------------------------------------------
+APK_SOURCES = [
+    {"id": "auto",     "name": "全部源自动聚合"},
+    {"id": "apkpure",  "name": "APKPure（海外全量）"},
+    {"id": "uptodown", "name": "Uptodown（海外/历史版）"},
+    {"id": "aptoide",  "name": "Aptoide（海外应用）"},
+    {"id": "huawei",   "name": "华为应用市场"},
+    {"id": "tencent",  "name": "腾讯应用宝"},
+    {"id": "vivo",     "name": "Vivo 应用商店"},
+    {"id": "fdroid",   "name": "F-Droid（开源）"},
+    {"id": "github",   "name": "GitHub Releases"},
+]
+APK_SOURCE_NAMES = {s["id"]: s["name"] for s in APK_SOURCES}
+APK_SOURCE_NAMES["direct"] = "直链下载"
+APK_SOURCE_NAMES["apkeep"] = "apkeep"
+
+APK_UA_BROWSER = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+APK_UA_DALVIK = "Dalvik/2.1.0 (Linux; U; Android 14; SM-G955F Build/AP2A.240805.005)"
+APK_EXTS = (".apk", ".xapk", ".apks", ".apkm", ".aab")
+
+# 短暂缓存搜索/版本里的直链和附加信息，避免前端传任意 URL 造成 SSRF
+APK_CACHE = {}
+APK_CACHE_LOCK = threading.Lock()
+APK_CACHE_TTL = 3600
+
+
+def apk_cache_put(token_key, info):
+    with APK_CACHE_LOCK:
+        now = time.time()
+        if len(APK_CACHE) > 500:
+            stale = [k for k, v in APK_CACHE.items() if now - v["t"] > APK_CACHE_TTL]
+            for k in stale:
+                APK_CACHE.pop(k, None)
+        APK_CACHE[token_key] = {"t": now, "data": info}
+
+
+def apk_cache_get(token_key):
+    with APK_CACHE_LOCK:
+        entry = APK_CACHE.get(token_key)
+        if not entry:
+            return None
+        if time.time() - entry["t"] > APK_CACHE_TTL:
+            APK_CACHE.pop(token_key, None)
+            return None
+        return entry["data"]
+
+
+def _http_read(url, headers=None, data=None, timeout=10):
+    hdrs = {"User-Agent": APK_UA_BROWSER}
+    if headers:
+        hdrs.update(headers)
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=hdrs)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read()
+        if raw[:2] == b"\x1f\x8b":
+            try:
+                raw = gzip.decompress(raw)
+            except Exception:
+                pass
+        return r.status, r.headers, raw
+
+
+def _http_json(url, headers=None, data=None, timeout=10):
+    _, _, raw = _http_read(url, headers=headers, data=data, timeout=timeout)
+    return json.loads(raw.decode("utf-8", "replace"))
+
+
+def _is_pkg_name(s):
+    return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+){1,}", s or ""))
+
+
+def _guess_pkg_ext(url, headers=None, fallback=".apk"):
+    cd = (headers.get("Content-Disposition") or "") if headers else ""
+    for text in (cd, urllib.parse.unquote(url or "")):
+        m = re.search(r"\.(xapk|apks|apkm|aab|apk)(?:[\"'?;&#\s]|$)", text, re.I)
+        if m:
+            return "." + m.group(1).lower()
+    return fallback if fallback.startswith(".") else "." + fallback
+
+
+def _extract_android_target(term):
+    """解析用户输入：识别直链、GitHub 仓库、各大商店链接、包名或普通关键词。"""
+    t = (term or "").strip()
+    # 1. 直接粘贴 .apk / .xapk / .apks 下载直链
+    if re.match(r"^https?://", t, re.I):
+        low_path = urllib.parse.urlparse(t).path.lower()
+        if any(low_path.endswith(ext) for ext in APK_EXTS):
+            return ("direct", t)
+        # Google Play: https://play.google.com/store/apps/details?id=com.xxx
+        m = re.search(r"play\.google\.com/store/apps/details.*[?&]id=([A-Za-z0-9_.]+)", t)
+        if m:
+            return ("package", m.group(1))
+        # GitHub 仓库或 release 链接
+        m = re.search(r"github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)", t)
+        if m:
+            repo = m.group(1).rstrip("/")
+            if repo.endswith(".git"):
+                repo = repo[:-4]
+            return ("github", repo)
+        # F-Droid 链接
+        m = re.search(r"f-droid\.org/(?:[a-zA-Z_-]+/)?packages/([A-Za-z0-9_.]+)", t)
+        if m:
+            return ("package", m.group(1))
+        # 腾讯应用宝链接
+        m = re.search(r"(?:sj\.qq\.com/appdetail/|a\.app\.qq\.com/.*pkgname=)([A-Za-z0-9_.]+)", t)
+        if m:
+            return ("package", m.group(1))
+        # APKPure 链接：https://apkpure.com/app-name/com.xxx.yyy
+        m = re.search(r"apkpure\.(?:com|net)/(?:[a-z]{2}/)?[^/]+/([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+)", t)
+        if m:
+            return ("package", m.group(1))
+        # 华为应用市场链接：https://appgallery.huawei.com/app/C10652857
+        m = re.search(r"appgallery\.(?:cloud\.)?huawei\.(?:com|ru)/(?:#/)?app/(C\d+)", t)
+        if m:
+            return ("huawei_id", m.group(1))
+        # Vivo 应用商店链接
+        m = re.search(r"vivo\.com\.cn/.*[?&](?:appId|id)=(\d+)", t)
+        if m:
+            return ("vivo_id", m.group(1))
+    # 2. owner/repo 格式（GitHub）
+    if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", t) and "." not in t.split("/")[0]:
+        return ("github", t)
+    # 3. 包名 com.xxx.yyy
+    if _is_pkg_name(t):
+        return ("package", t)
+    return ("keyword", t)
+
+
+# ---- 1. APKPure 移动端 API ----
+_APKPURE_BASE = "https://tapi.pureapk.com/v3"
+_APKPURE_AUTH = "qNKrYmW8SSUqJ73k3P2yfMxRTo3sJTR"
+_APKPURE_SIGN = "d33cb23fd17fda8ea38be504929b77ef"
+
+
+def _apkpure_headers(body=None):
+    dev_uuid = str(uuid.uuid4())
+    project_a = json.dumps({
+        "device_info": {
+            "abis": ["arm64-v8a", "armeabi-v7a", "x86_64"],
+            "android_id": hashlib.md5(dev_uuid.encode()).hexdigest()[:16],
+            "brand": "samsung", "country": "United States",
+            "country_code": "US", "imei": "", "language": "en-US",
+            "manufacturer": "samsung", "mode": "SM-G955F",
+            "os_ver": "34", "os_ver_name": "14", "platform": 1,
+            "product": "dream2lte", "screen_height": 2888, "screen_width": 1440,
+        },
+        "host_app_info": {
+            "build_no": "873", "channel": "", "md5": "",
+            "pkg_name": "com.apkpure.aegon", "sdk_ver": "3.20.6309",
+            "version_code": 3206397, "version_name": "3.20.6309",
+        },
+        "net_info": {
+            "carrier_code": 0, "ipv4": "", "ipv6": "", "mac_address": "",
+            "net_type": 1, "use_vpn": False, "wifi_bssid": "", "wifi_ssid": "",
+        },
+        "user_info": {
+            "auth_key": _APKPURE_AUTH, "country": "United States",
+            "country_code": "US", "guid": "", "language": "en-US",
+            "qimei": "", "qimei_token": "", "user_id": "", "uuid": dev_uuid,
+        },
+    }, separators=(",", ":"))
+    ext_info = json.dumps({
+        "ext_info": '{"gaid":"","oaid":""}',
+        "lbs_info": {
+            "accuracy": 0.0, "city": "", "city_code": 0,
+            "country": "", "country_code": "", "district": "",
+            "latitude": 0.0, "longitude": 0.0, "province": "", "street": "",
+        },
+    }, separators=(",", ":"))
+    hdrs = {
+        "User-Agent": APK_UA_DALVIK + "; APKPure/3.20.6309 (Aegon)",
+        "Ual-Access-Businessid": "projecta",
+        "Ual-Access-ProjectA": project_a,
+        "Ual-Access-ExtInfo": ext_info,
+        "Ual-Access-Sequence": str(uuid.uuid4()),
+        "Ual-Access-Signature": "",
+        "Ual-Access-Nonce": "0",
+        "Ual-Access-Timestamp": "0",
+        "Accept-Encoding": "gzip",
+    }
+    if body is not None:
+        ts = str(int(time.time() * 1000))
+        nonce = str(random.randint(10000000, 99999999))
+        sig = hashlib.md5((body + ts + _APKPURE_SIGN + nonce).encode()).hexdigest()
+        hdrs["Ual-Access-Signature"] = sig
+        hdrs["Ual-Access-Nonce"] = nonce
+        hdrs["Ual-Access-Timestamp"] = ts
+        hdrs["Content-Type"] = "application/json; charset=utf-8"
+    return hdrs
+
+
+def _apkpure_item(ai):
+    pkg = ai.get("package_name") or ""
+    if not pkg:
+        return None
+    asset = ai.get("asset") or {}
+    icon = ""
+    ic = ai.get("icon")
+    if isinstance(ic, dict):
+        icon = (ic.get("original") or ic.get("thumbnail") or {}).get("url") or ""
+    elif isinstance(ic, str):
+        icon = ic
+    ftype = (asset.get("type") or "APK").upper()
+    dl_url = asset.get("url") or ""
+    if not dl_url and isinstance(asset.get("urls"), list) and asset["urls"]:
+        dl_url = asset["urls"][0]
+    return {
+        "package": pkg,
+        "name": ai.get("title") or pkg,
+        "seller": ai.get("developer") or "APKPure",
+        "version": ai.get("version_name") or "",
+        "version_code": str(ai.get("version_code") or ""),
+        "size": int(asset.get("size") or 0),
+        "icon": icon,
+        "source": "apkpure",
+        "pkg_type": ftype,
+        "has_versions": True,
+        "dl_url": dl_url,
+        "dl_headers": {"User-Agent": APK_UA_DALVIK},
+    }
+
+
+def apkpure_search(query, limit=12):
+    qs = urllib.parse.urlencode({"hl": "en-US", "key": query, "page": "1", "search_type": "active_search"})
+    data = _http_json("%s/search_query_new?%s" % (_APKPURE_BASE, qs), headers=_apkpure_headers(), timeout=8)
+    out, seen = [], set()
+    for sec in (data.get("data") or {}).get("data") or []:
+        for it in sec.get("data") or []:
+            ai = it.get("app_info") or {}
+            pkg = ai.get("package_name") or ""
+            if not pkg or pkg in seen:
+                continue
+            seen.add(pkg)
+            item = _apkpure_item(ai)
+            if item:
+                out.append(item)
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def apkpure_detail(pkg):
+    body = json.dumps({"package_name": pkg, "hl": "en-US"})
+    data = _http_json("%s/get_app_detail" % _APKPURE_BASE, headers=_apkpure_headers(body), data=body, timeout=8)
+    detail = data.get("app_detail")
+    return _apkpure_item(detail) if isinstance(detail, dict) else None
+
+
+def apkpure_versions(pkg):
+    qs = urllib.parse.urlencode({"package_name": pkg, "hl": "en-US"})
+    data = _http_json("%s/get_app_his_version?%s" % (_APKPURE_BASE, qs), headers=_apkpure_headers(), timeout=10)
+    out = []
+    for v in data.get("version_list") or []:
+        asset = v.get("asset") or {}
+        urls = asset.get("urls") or ([asset.get("url")] if asset.get("url") else [])
+        dl_url = urls[0] if urls else ""
+        if not dl_url:
+            continue
+        archs = v.get("native_code") or []
+        arch_str = ",".join(str(x) for x in archs) if isinstance(archs, list) else ""
+        out.append({
+            "version": v.get("version_name") or str(v.get("version_code") or ""),
+            "version_code": str(v.get("version_code") or ""),
+            "date": str(v.get("update_date") or "")[:10],
+            "size": int(asset.get("size") or 0),
+            "pkg_type": (asset.get("type") or "APK").upper(),
+            "arch": arch_str,
+            "source": "apkpure",
+            "dl_url": dl_url,
+            "dl_headers": {"User-Agent": APK_UA_DALVIK},
+        })
+    return out
+
+
+# ---- 2. Uptodown 移动端 eAPI ----
+_UPTODOWN_BASE = "https://www.uptodown.app/eapi"
+_UPTODOWN_SECRET = "$(=a%\u00b7!45J&S"
+
+
+def _uptodown_headers():
+    hour_epoch = (int(time.time()) // 3600) * 3600
+    apikey = hashlib.sha256((_UPTODOWN_SECRET + str(hour_epoch)).encode("utf-8")).hexdigest()
+    return {
+        "User-Agent": APK_UA_DALVIK,
+        "Identificador": "Uptodown_Android",
+        "Identificador-Version": "707",
+        "APIKEY": apikey,
+    }
+
+
+def uptodown_search(query, limit=12):
+    q = urllib.parse.quote(query, safe="")
+    url = "%s/v2/apps/search/%s?page[limit]=%d&page[offset]=0" % (_UPTODOWN_BASE, q, limit)
+    data = _http_json(url, headers=_uptodown_headers(), timeout=8)
+    items = (data.get("data") or {}).get("results") or []
+    out = []
+    for it in items[:limit]:
+        pkg = it.get("packageName") or it.get("packagename") or ""
+        aid = str(it.get("appID") or it.get("id") or "")
+        if not pkg and not aid:
+            continue
+        out.append({
+            "package": pkg or ("uptodown:" + aid),
+            "name": it.get("name") or pkg,
+            "seller": it.get("author") or "Uptodown",
+            "version": it.get("version") or it.get("lastVersion") or "",
+            "version_code": str(it.get("versionCode") or ""),
+            "size": int(it.get("size") or 0),
+            "icon": it.get("iconURL") or it.get("icon") or "",
+            "source": "uptodown",
+            "pkg_type": "APK",
+            "has_versions": True,
+            "extra": {"app_id": aid},
+        })
+    return out
+
+
+def _uptodown_resolve_id(pkg, app_id=""):
+    if app_id:
+        return str(app_id)
+    if pkg.startswith("uptodown:"):
+        return pkg.split(":", 1)[1]
+    try:
+        d = _http_json("%s/apps/byPackagename/%s" % (_UPTODOWN_BASE, urllib.parse.quote(pkg, safe="")),
+                       headers=_uptodown_headers(), timeout=6)
+        inner = d.get("data") if isinstance(d.get("data"), dict) else d
+        aid = inner.get("appID") or inner.get("id")
+        if aid:
+            return str(aid)
+    except urllib.error.HTTPError:
+        pass
+    except Exception:
+        return ""
+    for it in uptodown_search(pkg, limit=5):
+        if it["package"] == pkg and (it.get("extra") or {}).get("app_id"):
+            return str(it["extra"]["app_id"])
+    return ""
+
+
+def uptodown_detail(pkg, app_id=""):
+    aid = _uptodown_resolve_id(pkg, app_id)
+    if not aid:
+        return None
+    d = _http_json("%s/v3/apps/%s/device/0?countryIsoCode=US" % (_UPTODOWN_BASE, aid),
+                   headers=_uptodown_headers(), timeout=8)
+    inner = d.get("data") if isinstance(d.get("data"), dict) else d
+    if not isinstance(inner, dict) or not inner.get("name"):
+        return None
+    return {
+        "package": inner.get("packagename") or pkg,
+        "name": inner.get("name") or pkg,
+        "seller": inner.get("author") or "Uptodown",
+        "version": inner.get("lastVersion") or str(inner.get("lastVersionCode") or ""),
+        "version_code": str(inner.get("lastVersionCode") or ""),
+        "size": int(inner.get("size") or 0),
+        "icon": inner.get("iconURL") or inner.get("icon") or "",
+        "source": "uptodown",
+        "pkg_type": "APK",
+        "has_versions": True,
+        "extra": {"app_id": aid},
+    }
+
+
+def uptodown_versions(pkg, app_id=""):
+    aid = _uptodown_resolve_id(pkg, app_id)
+    if not aid:
+        return []
+    d = _http_json("%s/v3/app/%s/device/1/compatible/versions?page[limit]=25&page[offset]=0" % (_UPTODOWN_BASE, aid),
+                   headers=_uptodown_headers(), timeout=10)
+    out = []
+    for v in d.get("data") or []:
+        fid = str(v.get("fileID") or v.get("fileid") or "")
+        if not fid:
+            continue
+        out.append({
+            "version": v.get("version") or str(v.get("versionCode") or ""),
+            "version_code": str(v.get("versionCode") or ""),
+            "date": str(v.get("lastUpdate") or ""),
+            "size": int(v.get("size") or 0),
+            "pkg_type": (v.get("fileType") or v.get("filetype") or "APK").upper(),
+            "arch": "",
+            "source": "uptodown",
+            "extra": {"app_id": aid, "file_id": fid},
+        })
+    return out
+
+
+def uptodown_resolve_download(pkg, extra=None, version=""):
+    extra = extra or {}
+    aid = _uptodown_resolve_id(pkg, extra.get("app_id", ""))
+    if not aid:
+        raise RuntimeError("Uptodown 未找到该应用")
+    fid = str(extra.get("file_id") or "")
+    ftype = "apk"
+    ver = version
+    if not fid:
+        vers = uptodown_versions(pkg, aid)
+        if not vers:
+            raise RuntimeError("Uptodown 未找到可下载版本")
+        target = next((v for v in vers if version and v["version"] == version), vers[0])
+        fid = target["extra"]["file_id"]
+        ftype = target["pkg_type"].lower()
+        ver = target["version"]
+    d = _http_json("%s/apps/%s/file/%s/downloadUrl?update=0" % (_UPTODOWN_BASE, aid, fid),
+                   headers=_uptodown_headers(), timeout=10)
+    dl_url = (d.get("data") or {}).get("downloadURL") or ""
+    if not dl_url:
+        raise RuntimeError("Uptodown 获取下载链接失败")
+    return dl_url, {"User-Agent": APK_UA_DALVIK}, "." + ftype, ver
+
+
+# ---- 3. Aptoide API v7 ----
+_APTOIDE_BASE = "https://ws75.aptoide.com/api/7"
+
+
+def _aptoide_item(it):
+    pkg = it.get("package") or ""
+    if not pkg:
+        return None
+    f = it.get("file") or {}
+    dl_url = f.get("path") or ""
+    return {
+        "package": pkg,
+        "name": it.get("name") or pkg,
+        "seller": (it.get("developer") or {}).get("name") or (it.get("store") or {}).get("name") or "Aptoide",
+        "version": f.get("vername") or "",
+        "version_code": str(f.get("vercode") or ""),
+        "size": int(it.get("size") or f.get("filesize") or 0),
+        "icon": it.get("icon") or "",
+        "source": "aptoide",
+        "pkg_type": "APK",
+        "has_versions": False,
+        "dl_url": dl_url,
+        "dl_headers": {"User-Agent": APK_UA_BROWSER},
+    }
+
+
+def aptoide_search(query, limit=12):
+    qs = urllib.parse.urlencode({"query": query, "limit": str(limit), "aab": "1"})
+    data = _http_json("%s/apps/search?%s" % (_APTOIDE_BASE, qs), timeout=8)
+    out = []
+    for it in (data.get("datalist") or {}).get("list") or []:
+        item = _aptoide_item(it)
+        if item:
+            out.append(item)
+    return out
+
+
+def aptoide_detail(pkg):
+    qs = urllib.parse.urlencode({"package_name": pkg, "aab": "1"})
+    data = _http_json("%s/app/getMeta?%s" % (_APTOIDE_BASE, qs), timeout=8)
+    d = data.get("data")
+    return _aptoide_item(d) if isinstance(d, dict) else None
+
+
+# ---- 4. 华为应用市场 AppGallery ----
+_HUAWEI_SESSION = {"t": 0, "host": "", "sign": "", "device_id": ""}
+_HUAWEI_LOCK = threading.Lock()
+_HUAWEI_HOSTS = {
+    "cn": "store-drcn.hispace.dbankcloud.com",
+    "asia": "store-dra.hispace.dbankcloud.com",
+    "eu": "store-dre.hispace.dbankcloud.com",
+}
+
+
+def _huawei_post(host, params, timeout=8):
+    body = "&".join("%s=%s" % (urllib.parse.quote_plus(k), urllib.parse.quote_plus(str(params[k])))
+                    for k in sorted(params.keys()))
+    hdrs = {
+        "User-Agent": "HiSpace##16.5.1.301##google##Pixel 8 Pro",
+        "Accept": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    return _http_json("https://%s/hwmarket/api/clientApi" % host, headers=hdrs, data=body, timeout=timeout)
+
+
+def _huawei_common(dev_id, locale="zh_CN"):
+    return {
+        "ver": "1.1", "locale": locale, "serviceType": "0",
+        "ts": str(int(time.time() * 1000)), "net": "1",
+        "brand": "google", "manufacturer": "Google", "subBrand": "0",
+        "deviceId": dev_id, "deviceIdType": "9",
+    }
+
+
+def _huawei_session(force=False):
+    with _HUAWEI_LOCK:
+        if not force and _HUAWEI_SESSION["sign"] and time.time() - _HUAWEI_SESSION["t"] < 3600:
+            return _HUAWEI_SESSION["host"], _HUAWEI_SESSION["sign"], _HUAWEI_SESSION["device_id"]
+        dev_id = "".join(random.choice("0123456789abcdef") for _ in range(64))
+        host = _HUAWEI_HOSTS["cn"] if CFG.get("country", "cn").lower() == "cn" else _HUAWEI_HOSTS["asia"]
+        p = dict(_huawei_common(dev_id), method="client.front2", version="16.5.1", versionCode="160501301",
+                 packageName="com.huawei.appmarket", zone="1", phoneType="Pixel 8 Pro",
+                 firmwareVersion="16", isFirstLaunch="1", oobe="0", needServiceZone="0")
+        res = _huawei_post(host, p, timeout=8)
+        sign = res.get("sign") or ""
+        if not sign:
+            host = _HUAWEI_HOSTS["eu"]
+            res = _huawei_post(host, p, timeout=8)
+            sign = res.get("sign") or ""
+        if not sign:
+            raise RuntimeError("华为应用市场握手失败")
+        _HUAWEI_SESSION.update(t=time.time(), host=host, sign=sign, device_id=dev_id)
+        return host, sign, dev_id
+
+
+def _huawei_item(app):
+    pkg = app.get("package") or ""
+    if not pkg:
+        return None
+    dl_url = app.get("downurl") or app.get("url") or ""
+    size = 0
+    for k in ("fullSize", "size", "bundleSize"):
+        try:
+            v = int(app.get(k) or 0)
+            if v > 0:
+                size = v
+                break
+        except Exception:
+            pass
+    return {
+        "package": pkg,
+        "name": app.get("name") or pkg,
+        "seller": app.get("developer") or "华为应用市场",
+        "version": app.get("versionName") or app.get("appVersionName") or "",
+        "version_code": str(app.get("versionCode") or ""),
+        "size": size,
+        "icon": app.get("icon") or app.get("icoUri") or "",
+        "source": "huawei",
+        "pkg_type": "APK",
+        "has_versions": False,
+        "dl_url": dl_url,
+        "dl_headers": {"User-Agent": APK_UA_BROWSER},
+        "extra": {"app_id": str(app.get("appid") or app.get("appId") or "")},
+    }
+
+
+def huawei_search(query, limit=12):
+    host, sign, dev_id = _huawei_session()
+    p = dict(_huawei_common(dev_id), method="client.getTabDetail", sign=sign,
+             uri="searchApp|" + query, maxResults=str(limit), reqPageNum="1", isSupportPage="1")
+    res = _huawei_post(host, p, timeout=8)
+    out, seen = [], set()
+    for layout in res.get("layoutData") or []:
+        for item in layout.get("dataList") or []:
+            app = item.get("appInfo") if isinstance(item.get("appInfo"), dict) else item
+            if not isinstance(app, dict):
+                continue
+            pkg = app.get("package") or ""
+            if not pkg or pkg in seen:
+                continue
+            if not (app.get("downurl") or app.get("appid")):
+                continue
+            seen.add(pkg)
+            it = _huawei_item(app)
+            if it:
+                out.append(it)
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def huawei_detail(pkg="", app_id=""):
+    host, sign, dev_id = _huawei_session()
+    if app_id:
+        p = dict(_huawei_common(dev_id), method="client.appDetailById", sign=sign, id=str(app_id))
+        res = _huawei_post(host, p, timeout=8)
+        di = res.get("detailInfo") or []
+        if isinstance(di, list) and di and isinstance(di[0], dict):
+            return _huawei_item(di[0])
+    if pkg:
+        p = dict(_huawei_common(dev_id), method="client.getTabDetail", sign=sign, uri="package|" + pkg)
+        res = _huawei_post(host, p, timeout=8)
+        best = {}
+        for layout in res.get("layoutData") or []:
+            for item in layout.get("dataList") or []:
+                if isinstance(item, dict) and item.get("package") == pkg:
+                    for k, v in item.items():
+                        if v and not best.get(k):
+                            best[k] = v
+        if best.get("downurl"):
+            return _huawei_item(best)
+    return None
+
+
+# ---- 5. 腾讯应用宝 ----
+def tencent_detail(pkg):
+    url = "https://a.app.qq.com/o/simple.jsp?pkgname=" + urllib.parse.quote(pkg, safe="")
+    _, _, raw = _http_read(url, timeout=8)
+    body = raw.decode("utf-8", "replace")
+    ad = None
+    for line in body.splitlines():
+        line = line.strip()
+        if line.startswith("window.systemData="):
+            try:
+                ad = json.loads(line[len("window.systemData="):]).get("appDetail")
+            except Exception:
+                pass
+            break
+    if not isinstance(ad, dict):
+        return None
+    dl_url = ad.get("apkUrl64") or ad.get("apkUrl") or ""
+    if not dl_url:
+        return None
+    fsize = ad.get("fileSize") or {}
+    size = int(fsize.get("bytes") or 0) if isinstance(fsize, dict) else 0
+    return {
+        "package": ad.get("packageName") or pkg,
+        "name": ad.get("appName") or pkg,
+        "seller": ad.get("author") or ad.get("developer") or "腾讯应用宝",
+        "version": str(ad.get("versionName") or ""),
+        "version_code": str(ad.get("versionCode") or ""),
+        "size": size,
+        "icon": ad.get("iconUrl") or "",
+        "source": "tencent",
+        "pkg_type": "APK",
+        "has_versions": False,
+        "dl_url": dl_url,
+        "dl_headers": {"User-Agent": APK_UA_BROWSER},
+    }
+
+
+def tencent_search(query, limit=12):
+    url = "https://sj.qq.com/search?q=" + urllib.parse.quote(query, safe="")
+    _, _, raw = _http_read(url, timeout=8)
+    body = raw.decode("utf-8", "replace")
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', body, re.S)
+    if not m:
+        return []
+    data = json.loads(m.group(1))
+    out, seen = [], set()
+
+    def walk(obj):
+        if len(out) >= limit:
+            return
+        if isinstance(obj, dict):
+            pkg = obj.get("pkg_name") or ""
+            name = obj.get("name") or ""
+            # 过滤掉 PC 应用和无包名项
+            if pkg and name and ".pcapp." not in pkg and ".pcgame." not in pkg and pkg not in seen:
+                seen.add(pkg)
+                try:
+                    size = int(obj.get("apk_size") or 0)
+                except Exception:
+                    size = 0
+                out.append({
+                    "package": pkg,
+                    "name": name,
+                    "seller": obj.get("developer") or "腾讯应用宝",
+                    "version": str(obj.get("version_name") or ""),
+                    "version_code": "",
+                    "size": size,
+                    "icon": obj.get("icon") or "",
+                    "source": "tencent",
+                    "pkg_type": "APK",
+                    "has_versions": False,
+                    "dl_url": obj.get("download_url") or obj.get("apk_url") or "",
+                    "dl_headers": {"User-Agent": APK_UA_BROWSER},
+                })
+            for v in obj.values():
+                walk(v)
+        elif isinstance(obj, list):
+            for x in obj:
+                walk(x)
+
+    walk(data)
+    return out
+
+
+# ---- 6. Vivo 应用商店 ----
+def _vivo_item(it):
+    pkg = it.get("package_name") or ""
+    vid = str(it.get("id") or "")
+    if not pkg or not vid:
+        return None
+    # Vivo 返回的 size 单位是 KB
+    try:
+        size = int(it.get("size") or 0) * 1024
+    except Exception:
+        size = 0
+    return {
+        "package": pkg,
+        "name": it.get("title_zh") or it.get("title_en") or pkg,
+        "seller": it.get("developer") or "Vivo 应用商店",
+        "version": str(it.get("version_name") or ""),
+        "version_code": str(it.get("version_code") or ""),
+        "size": size,
+        "icon": it.get("icon_url") or "",
+        "source": "vivo",
+        "pkg_type": "APK",
+        "has_versions": False,
+        "dl_url": "https://appstore.vivo.com.cn/appinfo/downloadApkFile?id=" + urllib.parse.quote(vid, safe=""),
+        "dl_headers": {"User-Agent": APK_UA_BROWSER},
+        "extra": {"app_id": vid},
+    }
+
+
+def vivo_search(query, limit=12):
+    qs = urllib.parse.urlencode({
+        "app_version": "2100", "page_index": "1", "apps_per_page": str(limit),
+        "target": "local", "cfrom": "2", "key": query,
+    })
+    data = _http_json("https://h5-api.appstore.vivo.com.cn/h5appstore/search/result-list?" + qs, timeout=8)
+    items = ((data.get("data") or {}).get("appSearchResponse") or {}).get("value") or []
+    out = []
+    for it in items[:limit]:
+        if isinstance(it, dict):
+            item = _vivo_item(it)
+            if item:
+                out.append(item)
+    return out
+
+
+def vivo_detail(app_id):
+    data = _http_json("https://h5-api.appstore.vivo.com.cn/detailInfo?appId=" + urllib.parse.quote(str(app_id), safe=""), timeout=8)
+    return _vivo_item(data) if isinstance(data, dict) else None
+
+
+# ---- 7. F-Droid（支持官方 + 清华镜像回退）----
+_FDROID_REPOS = [
+    "https://f-droid.org/repo",
+    "https://mirrors.tuna.tsinghua.edu.cn/fdroid/repo",
+]
+
+
+def fdroid_search(query, limit=12):
+    qs = urllib.parse.urlencode({"q": query})
+    _, _, raw = _http_read("https://search.f-droid.org/?" + qs, timeout=8)
+    html = raw.decode("utf-8", "replace")
+    out, seen = [], set()
+    for m in re.finditer(r'<a[^>]+href="[^"]*?/packages/([A-Za-z0-9_.]+)/?"[^>]*>(.*?)</a>', html, re.S):
+        pkg, inner = m.group(1), m.group(2)
+        if pkg in seen:
+            continue
+        seen.add(pkg)
+        nm = re.search(r'class="package-name"[^>]*>(.*?)</', inner, re.S)
+        name = re.sub(r"<[^>]+>", "", nm.group(1)).strip() if nm else pkg
+        im = re.search(r'<img[^>]+src="([^"]+)"', inner)
+        icon = im.group(1) if im else ""
+        if icon.startswith("/"):
+            icon = "https://f-droid.org" + icon
+        out.append({
+            "package": pkg,
+            "name": name or pkg,
+            "seller": "F-Droid",
+            "version": "",
+            "version_code": "",
+            "size": 0,
+            "icon": icon,
+            "source": "fdroid",
+            "pkg_type": "APK",
+            "has_versions": True,
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _fdroid_meta_from_gitlab(pkg):
+    """当 f-droid.org 不可达时，从 GitLab fdroiddata 读取包版本列表，再走清华镜像下载。"""
+    url = "https://gitlab.com/fdroid/fdroiddata/-/raw/master/metadata/%s.yml" % urllib.parse.quote(pkg, safe="")
+    _, _, raw = _http_read(url, timeout=8)
+    text = raw.decode("utf-8", "replace")
+    nm = re.search(r"^(?:AutoName|Name):\s*(.+)$", text, re.M)
+    name = nm.group(1).strip().strip("'\"") if nm else pkg
+    vers = re.findall(r"-\s*versionName:\s*['\"]?([^'\"\n]+)['\"]?\s*\n\s*versionCode:\s*(\d+)", text)
+    if not vers:
+        cv = re.search(r"^CurrentVersion:\s*(.+)$", text, re.M)
+        cc = re.search(r"^CurrentVersionCode:\s*(\d+)$", text, re.M)
+        if cv and cc:
+            vers = [(cv.group(1).strip().strip("'\""), cc.group(1))]
+    packages = [{"versionName": v, "versionCode": int(c)} for v, c in reversed(vers)]
+    return {"name": name, "packages": packages}
+
+
+def fdroid_versions(pkg):
+    packages = []
+    try:
+        d = _http_json("https://f-droid.org/api/v1/packages/" + urllib.parse.quote(pkg, safe=""), timeout=8)
+        packages = d.get("packages") or []
+    except Exception:
+        try:
+            packages = _fdroid_meta_from_gitlab(pkg).get("packages") or []
+        except Exception:
+            packages = []
+    out = []
+    for p in packages[:25]:
+        vc = str(p.get("versionCode") or "")
+        vn = str(p.get("versionName") or vc)
+        if not vc:
+            continue
+        out.append({
+            "version": vn,
+            "version_code": vc,
+            "date": "",
+            "size": 0,
+            "pkg_type": "APK",
+            "arch": "",
+            "source": "fdroid",
+            "dl_url": "%s/%s_%s.apk" % (_FDROID_REPOS[0], pkg, vc),
+            "fallback_urls": ["%s/%s_%s.apk" % (r, pkg, vc) for r in _FDROID_REPOS[1:]],
+            "dl_headers": {"User-Agent": "F-Droid"},
+        })
+    return out
+
+
+def fdroid_detail(pkg):
+    vers = fdroid_versions(pkg)
+    if not vers:
+        return None
+    top = vers[0]
+    return {
+        "package": pkg,
+        "name": pkg,
+        "seller": "F-Droid",
+        "version": top["version"],
+        "version_code": top["version_code"],
+        "size": 0,
+        "icon": "https://f-droid.org/repo/%s/en-US/icon.png" % pkg,
+        "source": "fdroid",
+        "pkg_type": "APK",
+        "has_versions": True,
+        "dl_url": top["dl_url"],
+        "fallback_urls": top.get("fallback_urls") or [],
+        "dl_headers": {"User-Agent": "F-Droid"},
+    }
+
+
+# ---- 8. GitHub Releases ----
+def _gh_pick_apk(assets):
+    apks = [a for a in (assets or [])
+            if any((a.get("name") or "").lower().endswith(ext) for ext in APK_EXTS)]
+    if not apks:
+        return None
+    def score(a):
+        n = (a.get("name") or "").lower()
+        return (
+            1 if ("universal" in n or "all" in n) else 0,
+            1 if ("arm64" in n or "v8a" in n) else 0,
+            0 if ("x86" in n or "armeabi-v7a" in n) else 1,
+            int(a.get("size") or 0),
+        )
+    return sorted(apks, key=score, reverse=True)[0]
+
+
+def github_repo_detail(repo):
+    hdrs = {"User-Agent": "ipa-web/" + VERSION, "Accept": "application/vnd.github+json"}
+    rel = _http_json("https://api.github.com/repos/%s/releases/latest" % repo, headers=hdrs, timeout=8)
+    best = _gh_pick_apk(rel.get("assets"))
+    if not best:
+        # 有些项目最新是 pre-release，扫一次 releases 列表
+        rels = _http_json("https://api.github.com/repos/%s/releases?per_page=5" % repo, headers=hdrs, timeout=8)
+        for r in rels or []:
+            best = _gh_pick_apk(r.get("assets"))
+            if best:
+                rel = r
+                break
+    if not best:
+        return None
+    owner = repo.split("/")[0]
+    ext = _guess_pkg_ext(best.get("name", ""))
+    return {
+        "package": "gh:" + repo,
+        "name": repo.split("/")[-1],
+        "seller": "GitHub · " + owner,
+        "version": (rel.get("tag_name") or "").lstrip("v"),
+        "version_code": "",
+        "size": int(best.get("size") or 0),
+        "icon": "https://github.com/%s.png?size=128" % owner,
+        "source": "github",
+        "pkg_type": ext.lstrip(".").upper(),
+        "has_versions": True,
+        "dl_url": best.get("browser_download_url") or "",
+        "dl_headers": {"User-Agent": "ipa-web/" + VERSION},
+        "extra": {"repo": repo, "asset_name": best.get("name") or ""},
+    }
+
+
+def github_versions(repo):
+    hdrs = {"User-Agent": "ipa-web/" + VERSION, "Accept": "application/vnd.github+json"}
+    rels = _http_json("https://api.github.com/repos/%s/releases?per_page=20" % repo, headers=hdrs, timeout=10)
+    out = []
+    for rel in rels or []:
+        tag = (rel.get("tag_name") or "").lstrip("v")
+        date = str(rel.get("published_at") or "")[:10]
+        for a in rel.get("assets") or []:
+            aname = a.get("name") or ""
+            if not any(aname.lower().endswith(ext) for ext in APK_EXTS):
+                continue
+            ext = _guess_pkg_ext(aname)
+            out.append({
+                "version": "%s (%s)" % (tag, aname),
+                "version_code": tag,
+                "date": date,
+                "size": int(a.get("size") or 0),
+                "pkg_type": ext.lstrip(".").upper(),
+                "arch": "",
+                "source": "github",
+                "dl_url": a.get("browser_download_url") or "",
+                "dl_headers": {"User-Agent": "ipa-web/" + VERSION},
+            })
+    return out
+
+
+def github_search(query, limit=6):
+    hdrs = {"User-Agent": "ipa-web/" + VERSION, "Accept": "application/vnd.github+json"}
+    q = urllib.parse.urlencode({"q": query + " android", "sort": "stars", "per_page": str(limit)})
+    data = _http_json("https://api.github.com/search/repositories?" + q, headers=hdrs, timeout=8)
+    repos = [it.get("full_name") for it in (data.get("items") or []) if it.get("full_name")]
+    out = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+        futs = [ex.submit(github_repo_detail, r) for r in repos[:limit]]
+        for fut in futs:
+            try:
+                it = fut.result(timeout=8)
+                if it:
+                    out.append(it)
+            except Exception:
+                pass
+    return out
+
+
+# ---- 聚合搜索 / 查版本 / 下载解析 ----
+def _cache_and_slim_apk(item):
+    token = secrets.token_hex(8)
+    apk_cache_put(token, item)
+    return {
+        "token": token,
+        "package": item.get("package", ""),
+        "name": item.get("name", ""),
+        "seller": item.get("seller", ""),
+        "version": item.get("version", ""),
+        "size": int(item.get("size") or 0),
+        "icon": item.get("icon", ""),
+        "source": item.get("source", ""),
+        "source_name": APK_SOURCE_NAMES.get(item.get("source", ""), item.get("source", "")),
+        "pkg_type": item.get("pkg_type", "APK"),
+        "has_versions": bool(item.get("has_versions")),
+        "extra": item.get("extra") or {},
+    }
+
+
+def search_android(term, source="auto"):
+    kind, val = _extract_android_target(term)
+    if kind == "direct":
+        fname = os.path.basename(urllib.parse.urlparse(val).path) or "app.apk"
+        ext = _guess_pkg_ext(val)
+        item = {
+            "package": fname,
+            "name": fname,
+            "seller": urllib.parse.urlparse(val).netloc,
+            "version": "",
+            "size": 0,
+            "icon": "",
+            "source": "direct",
+            "pkg_type": ext.lstrip(".").upper(),
+            "has_versions": False,
+            "dl_url": val,
+            "dl_headers": {"User-Agent": APK_UA_BROWSER},
+        }
+        return [_cache_and_slim_apk(item)]
+    if kind == "github":
+        it = github_repo_detail(val)
+        return [_cache_and_slim_apk(it)] if it else []
+    if kind == "huawei_id":
+        it = huawei_detail(app_id=val)
+        return [_cache_and_slim_apk(it)] if it else []
+    if kind == "vivo_id":
+        it = vivo_detail(val)
+        return [_cache_and_slim_apk(it)] if it else []
+
+    if source != "auto":
+        sources = [source]
+    elif kind == "package":
+        sources = ["apkpure", "huawei", "tencent", "uptodown", "aptoide", "fdroid"]
+    else:
+        sources = ["apkpure", "huawei", "tencent", "vivo", "uptodown", "aptoide", "fdroid"]
+
+    def run_one(src):
+        if kind == "package":
+            fn = {
+                "apkpure": apkpure_detail,
+                "huawei": lambda p: huawei_detail(pkg=p),
+                "tencent": tencent_detail,
+                "uptodown": uptodown_detail,
+                "aptoide": aptoide_detail,
+                "fdroid": fdroid_detail,
+                "vivo": lambda p: next((x for x in vivo_search(p, 5) if x["package"] == p), None),
+                "github": lambda p: None,
+            }.get(src)
+            r = fn(val) if fn else None
+            return [r] if r else []
+        fn = {
+            "apkpure": apkpure_search,
+            "huawei": huawei_search,
+            "tencent": tencent_search,
+            "vivo": vivo_search,
+            "uptodown": uptodown_search,
+            "aptoide": aptoide_search,
+            "fdroid": fdroid_search,
+            "github": github_search,
+        }.get(src)
+        return fn(val) if fn else []
+
+    raw_items = []
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=len(sources))
+    futs = {ex.submit(run_one, s): s for s in sources}
+    try:
+        for fut in concurrent.futures.as_completed(futs, timeout=10):
+            src = futs[fut]
+            try:
+                res = fut.result() or []
+                raw_items.extend(res)
+            except Exception as e:
+                log("安卓源搜索失败", src, val, e)
+    except concurrent.futures.TimeoutError:
+        log("安卓部分源搜索超时，已返回其余源结果", val)
+    finally:
+        ex.shutdown(wait=False)
+
+    # 关键词搜索时按 (package, source) 去重；如果全部源聚合，把精确命中和有直链的排前面
+    out, seen = [], set()
+    q_low = val.lower()
+    for it in raw_items:
+        key = (it.get("package", ""), it.get("source", ""))
+        if not key[0] or key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+
+    if source == "auto":
+        src_rank = {"apkpure": 0, "huawei": 1, "tencent": 2, "vivo": 3, "uptodown": 4, "aptoide": 5, "fdroid": 6, "github": 7}
+        def rank(it):
+            name_l = (it.get("name") or "").lower()
+            pkg_l = (it.get("package") or "").lower()
+            exact = 0 if (pkg_l == q_low or name_l == q_low) else (1 if q_low in name_l or q_low in pkg_l else 2)
+            has_icon = 0 if it.get("icon") else 1
+            return (exact, has_icon, src_rank.get(it.get("source", ""), 9))
+        out.sort(key=rank)
+
+    return [_cache_and_slim_apk(it) for it in out[:30]]
+
+
+def android_versions(pkg, source, extra=None):
+    extra = extra or {}
+    if source == "github" or pkg.startswith("gh:"):
+        repo = extra.get("repo") or (pkg[3:] if pkg.startswith("gh:") else pkg)
+        vers = github_versions(repo)
+    elif source == "apkpure":
+        vers = apkpure_versions(pkg)
+    elif source == "uptodown":
+        vers = uptodown_versions(pkg, extra.get("app_id", ""))
+    elif source == "fdroid":
+        vers = fdroid_versions(pkg)
+    else:
+        # 其他源（如华为/应用宝/Vivo/Aptoide）本身不提供历史版，尝试从 APKPure / Uptodown / F-Droid 查同包名历史版
+        vers = []
+        for fn in (apkpure_versions, uptodown_versions, fdroid_versions):
+            try:
+                vers = fn(pkg)
+                if vers:
+                    break
+            except Exception:
+                pass
+    out = []
+    for v in vers[:30]:
+        tok = secrets.token_hex(8)
+        apk_cache_put(tok, dict(v, package=pkg))
+        out.append({
+            "token": tok,
+            "version": v.get("version", ""),
+            "version_code": v.get("version_code", ""),
+            "date": v.get("date", ""),
+            "size": int(v.get("size") or 0),
+            "pkg_type": v.get("pkg_type", "APK"),
+            "arch": v.get("arch", ""),
+            "source": v.get("source", source),
+            "source_name": APK_SOURCE_NAMES.get(v.get("source", source), source),
+        })
+    return out
+
+
+def _download_apk_stream(url, dest_dir, base_name, version, headers=None, expected_ext=".apk", timeout=7200):
+    hdrs = {"User-Agent": APK_UA_BROWSER}
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(url, headers=hdrs)
+    with urllib.request.urlopen(req, timeout=15) as r:
+        ext = _guess_pkg_ext(r.geturl() or url, r.headers, expected_ext)
+        total = int(r.headers.get("Content-Length") or 0)
+        fname = safe_filename(base_name, version, ext=ext)
+        part = os.path.join(dest_dir, fname + ".part")
+        final = os.path.join(dest_dir, fname)
+        got = 0
+        first_chunk = b""
+        with open(part, "wb") as f:
+            while True:
+                chunk = r.read(256 * 1024)
+                if not chunk:
+                    break
+                if not first_chunk:
+                    first_chunk = chunk[:16]
+                    # APK / XAPK / APKS / AAB 都是 ZIP 格式（PK\x03\x04）
+                    if not first_chunk.startswith(b"PK"):
+                        f.close()
+                        os.remove(part)
+                        ct = r.headers.get("Content-Type", "")
+                        raise RuntimeError("返回的不是有效安装包（Content-Type: %s），可能被源站拦截" % ct)
+                f.write(chunk)
+                got += len(chunk)
+        if total > 0 and got < total:
+            os.remove(part)
+            raise RuntimeError("文件下载不完整（%d / %d 字节）" % (got, total))
+        if got < 4096:
+            os.remove(part)
+            raise RuntimeError("下载到的文件过小（%d 字节），不是有效安装包" % got)
+        os.replace(part, final)
+        return final, fname, got
+
+
+def _apkeep_fallback(pkg, dest_dir, version=""):
+    """如果系统装了 EFF apkeep，作为 APKPure / F-Droid 的额外下载兜底。"""
+    ak = CFG.get("apkeep_bin") or os.path.join(BASE_DIR, "bin", "apkeep")
+    if not (ak and os.path.isfile(ak) and os.access(ak, os.X_OK)):
+        return None
+    app_arg = "%s@%s" % (pkg, version) if version else pkg
+    attempts = [
+        [ak, "-a", app_arg, "-d", "apk-pure", "-o", "acknowledge_dangers=true", dest_dir],
+        [ak, "-a", app_arg, "-d", "f-droid", dest_dir],
+    ]
+    for cmd in attempts:
+        try:
+            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=1800)
+            if p.returncode == 0:
+                for root, _, files in os.walk(dest_dir):
+                    for fn in files:
+                        if any(fn.lower().endswith(ext) for ext in APK_EXTS):
+                            full = os.path.join(root, fn)
+                            if os.path.getsize(full) > 4096:
+                                return full, fn, os.path.getsize(full)
+        except Exception:
+            pass
+    return None
+
+
+def download_android_job(job):
+    pkg = job["app_id"]
+    src = job.get("source", "")
+    cached = job.get("apk_info") or {}
+    ver = job.get("version", "")
+    name = job.get("name") or pkg
+    errors = []
+
+    def try_urls(urls, hdrs, ext_hint, label):
+        for u in urls:
+            if not u:
+                continue
+            try:
+                return _download_apk_stream(u, job["dir"], name, ver, headers=hdrs, expected_ext=ext_hint)
+            except Exception as e:
+                errors.append("%s: %s" % (label, e))
+        return None
+
+    # 1. 优先用已拿到的直链（如 APKPure / 华为 / Vivo / 应用宝 / Aptoide / GitHub / 直链）
+    if cached.get("dl_url"):
+        urls = [cached["dl_url"]] + list(cached.get("fallback_urls") or [])
+        ext_hint = "." + (cached.get("pkg_type") or "apk").lower()
+        res = try_urls(urls, cached.get("dl_headers"), ext_hint, APK_SOURCE_NAMES.get(src, src))
+        if res:
+            return res
+
+    # 2. 按指定源解析下载链接（例如 Uptodown 或搜索结果里不含直链的应用宝）
+    if src == "uptodown":
+        try:
+            u, hdrs, ext_hint, rver = uptodown_resolve_download(pkg, cached.get("extra"), ver)
+            if rver and not ver:
+                ver = rver
+                job["version"] = rver
+            res = try_urls([u], hdrs, ext_hint, "Uptodown")
+            if res:
+                return res
+        except Exception as e:
+            errors.append("Uptodown: %s" % e)
+    elif src == "tencent":
+        try:
+            d = tencent_detail(pkg)
+            if d and d.get("dl_url"):
+                res = try_urls([d["dl_url"]], d.get("dl_headers"), ".apk", "腾讯应用宝")
+                if res:
+                    return res
+        except Exception as e:
+            errors.append("腾讯应用宝: %s" % e)
+    elif src == "huawei":
+        try:
+            d = huawei_detail(pkg=pkg, app_id=(cached.get("extra") or {}).get("app_id", ""))
+            if d and d.get("dl_url"):
+                res = try_urls([d["dl_url"]], d.get("dl_headers"), ".apk", "华为应用市场")
+                if res:
+                    return res
+        except Exception as e:
+            errors.append("华为应用市场: %s" % e)
+
+    # 3. 多源自动回退（当包名合法且不是直链/GitHub 时）
+    if _is_pkg_name(pkg) and not ver:
+        fallbacks = [
+            ("apkpure", apkpure_detail),
+            ("huawei", lambda p: huawei_detail(pkg=p)),
+            ("tencent", tencent_detail),
+            ("aptoide", aptoide_detail),
+            ("fdroid", fdroid_detail),
+        ]
+        for fb_id, fb_fn in fallbacks:
+            if fb_id == src:
+                continue
+            try:
+                d = fb_fn(pkg)
+                if d and d.get("dl_url"):
+                    urls = [d["dl_url"]] + list(d.get("fallback_urls") or [])
+                    ext_hint = "." + (d.get("pkg_type") or "apk").lower()
+                    res = try_urls(urls, d.get("dl_headers"), ext_hint, APK_SOURCE_NAMES.get(fb_id, fb_id))
+                    if res:
+                        job["source"] = fb_id
+                        if d.get("version") and not job.get("version"):
+                            job["version"] = d["version"]
+                        return res
+            except Exception as e:
+                errors.append("%s: %s" % (APK_SOURCE_NAMES.get(fb_id, fb_id), e))
+        # 再试 Uptodown
+        if src != "uptodown":
+            try:
+                u, hdrs, ext_hint, rver = uptodown_resolve_download(pkg)
+                res = try_urls([u], hdrs, ext_hint, "Uptodown")
+                if res:
+                    job["source"] = "uptodown"
+                    if rver and not job.get("version"):
+                        job["version"] = rver
+                    return res
+            except Exception as e:
+                errors.append("Uptodown: %s" % e)
+
+    # 4. apkeep 命令行兜底
+    if _is_pkg_name(pkg):
+        res = _apkeep_fallback(pkg, job["dir"], ver)
+        if res:
+            job["source"] = "apkeep"
+            return res
+
+    raise RuntimeError("所有可用安卓源都下载失败：" + ("；".join(errors[-3:]) if errors else "未找到安装包"))
+
+
+#----------------------------------------------------------------------
+# 下载任务。同时只跑 max_concurrent 个任务，小内存机器默认 1 个，其余排队。
 #----------------------------------------------------------------------
 JOBS = {}
 JOBS_LOCK = threading.Lock()
@@ -1569,14 +2888,19 @@ def dir_size(path):
     return total
 
 
-def safe_filename(name, version):
+def safe_filename(name, version, ext=".ipa"):
     base = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "_", name).strip(" .") or "app"
     ver = re.sub(r"[^0-9A-Za-z._-]+", "_", version or "")
-    return "%s_%s.ipa" % (base[:80], ver) if ver else "%s.ipa" % base[:80]
+    if not ext.startswith("."):
+        ext = "." + ext
+    if base.lower().endswith(ext.lower()):
+        base = base[:-len(ext)]
+    return "%s_%s%s" % (base[:80], ver, ext) if ver else "%s%s" % (base[:80], ext)
 
 
 def job_public(j):
-    d = {k: j.get(k) for k in ("id", "app_id", "name", "version", "icon", "size", "account", "country",
+    d = {k: j.get(k) for k in ("id", "platform", "app_id", "name", "version", "icon", "size",
+                                "account", "country", "source", "source_name", "pkg_type",
                                 "status", "error", "created", "finished", "filename")}
     if j["status"] == "running":
         d["bytes"] = dir_size(j["dir"])
@@ -1597,6 +2921,25 @@ def run_job(job):
             return
         job["status"] = "running"
         job["started"] = time.time()
+        if job.get("platform") == "android":
+            log("开始下载安卓", job["app_id"], job["name"], job.get("source"), job.get("version") or "最新版")
+            try:
+                fpath, fname, fsize = download_android_job(job)
+                job["file"] = fpath
+                job["filename"] = fname
+                job["file_size"] = fsize
+                job["source_name"] = APK_SOURCE_NAMES.get(job.get("source", ""), job.get("source", ""))
+                job["pkg_type"] = os.path.splitext(fname)[1].lstrip(".").upper() or "APK"
+                job["status"] = "done"
+                log("安卓下载完成", job["app_id"], fname, fsize, "字节")
+            except Exception as e:
+                job["status"] = "error"
+                job["error"] = str(e)
+                log("安卓下载失败", job["app_id"], job["name"], e)
+                shutil.rmtree(job["dir"], ignore_errors=True)
+            job["finished"] = time.time()
+            return
+
         log("开始下载", job["app_id"], job["name"], job.get("ext_ver") or "最新版")
         args = ["download", "-i", str(job["app_id"]), "--purchase", "-o", job["dir"]]
         if job.get("ext_ver"):
@@ -1647,9 +2990,13 @@ def new_job(app_id, ext_ver=""):
     jid = secrets.token_hex(8)
     job = {
         "id": jid,
+        "platform": "ios",
         "home": CFG["home_dir"],
         "account": CFG["apple_id"],
         "country": CFG["country"],
+        "source": "appstore",
+        "source_name": "App Store",
+        "pkg_type": "IPA",
         "app_id": app_id,
         "ext_ver": ext_ver,
         "name": info.get("name") or str(app_id),
@@ -1662,7 +3009,47 @@ def new_job(app_id, ext_ver=""):
         "finished": 0,
         "dir": os.path.join(CFG["data_dir"], jid),
     }
-    job["filename"] = safe_filename(job["name"], job["version"] or ext_ver)
+    job["filename"] = safe_filename(job["name"], job["version"] or ext_ver, ext=".ipa")
+    os.makedirs(job["dir"], exist_ok=True)
+    with JOBS_LOCK:
+        JOBS[jid] = job
+    threading.Thread(target=run_job, args=(job,), daemon=True).start()
+    return job
+
+
+def new_android_job(pkg, source="", version="", name="", icon="", size=0, cached=None):
+    cached = cached or {}
+    pkg = pkg or cached.get("package") or ""
+    source = source or cached.get("source") or "auto"
+    version = version or cached.get("version") or ""
+    name = name or cached.get("name") or pkg
+    icon = icon or cached.get("icon") or ""
+    size = int(size or cached.get("size") or 0)
+    pkg_type = (cached.get("pkg_type") or "APK").upper()
+    jid = secrets.token_hex(8)
+    job = {
+        "id": jid,
+        "platform": "android",
+        "home": "",
+        "account": "",
+        "country": "",
+        "source": source,
+        "source_name": APK_SOURCE_NAMES.get(source, source),
+        "pkg_type": pkg_type,
+        "app_id": pkg,
+        "ext_ver": version,
+        "name": name,
+        "version": version,
+        "icon": icon,
+        "size": size,
+        "apk_info": cached,
+        "status": "queued",
+        "error": "",
+        "created": time.time(),
+        "finished": 0,
+        "dir": os.path.join(CFG["data_dir"], jid),
+    }
+    job["filename"] = safe_filename(name, version, ext="." + pkg_type.lower())
     os.makedirs(job["dir"], exist_ok=True)
     with JOBS_LOCK:
         JOBS[jid] = job
@@ -1787,6 +3174,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.need_auth():
                 return
             if path == "/api/status":
+                ak = CFG.get("apkeep_bin") or os.path.join(BASE_DIR, "bin", "apkeep")
                 return self.send_json({
                     "account": account_info(force=q.get("force") == ["1"]),
                     "country": CFG["country"],
@@ -1796,6 +3184,8 @@ class Handler(BaseHTTPRequestHandler):
                     "retention_minutes": CFG["retention_minutes"],
                     "max_concurrent": CFG["max_concurrent"],
                     "disk_free": shutil.disk_usage(CFG["data_dir"]).free,
+                    "android_sources": APK_SOURCES,
+                    "has_apkeep": bool(ak and os.path.isfile(ak) and os.access(ak, os.X_OK)),
                 })
             if path == "/api/search":
                 term = (q.get("q") or [""])[0]
@@ -1805,6 +3195,32 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json({"results": search_apps(term)})
                 except Exception as e:
                     return self.send_json({"error": "搜索失败：%s" % e}, 502)
+            if path == "/api/android/search":
+                term = (q.get("q") or [""])[0]
+                src = (q.get("source") or ["auto"])[0]
+                if src not in APK_SOURCE_NAMES:
+                    src = "auto"
+                if not term.strip():
+                    return self.send_json({"results": []})
+                try:
+                    return self.send_json({"results": search_android(term, src)})
+                except Exception as e:
+                    return self.send_json({"error": "安卓搜索失败：%s" % e}, 502)
+            if path == "/api/android/versions":
+                pkg = (q.get("pkg") or [""])[0].strip()
+                src = (q.get("source") or [""])[0].strip()
+                tok = (q.get("token") or [""])[0].strip()
+                cached = apk_cache_get(tok) if tok else None
+                if cached:
+                    pkg = pkg or cached.get("package", "")
+                    src = src or cached.get("source", "")
+                if not pkg:
+                    return self.send_json({"error": "缺少包名"}, 400)
+                try:
+                    vers = android_versions(pkg, src, (cached or {}).get("extra"))
+                    return self.send_json({"versions": vers})
+                except Exception as e:
+                    return self.send_json({"error": "查历史版本失败：%s" % e}, 502)
             if path == "/api/versions":
                 return self.api_versions(q)
             if path == "/api/version-meta":
@@ -1841,10 +3257,30 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json({"error": "VPS 硬盘剩余不到 300MB，先清理一下再下"}, 507)
                 with JOBS_LOCK:
                     for j in JOBS.values():
-                        if (j["app_id"] == app_id and j["ext_ver"] == ext_ver and j["home"] == CFG["home_dir"]
-                                and j["status"] in ("queued", "running", "done")):
+                        if (j.get("platform", "ios") == "ios" and j["app_id"] == app_id and j["ext_ver"] == ext_ver
+                                and j["home"] == CFG["home_dir"] and j["status"] in ("queued", "running", "done")):
                             return self.send_json({"job": j["id"], "existing": True})
                 job = new_job(app_id, ext_ver)
+                return self.send_json({"job": job["id"]})
+            if path == "/api/android/download":
+                tok = str(body.get("token", "") or "").strip()
+                cached = apk_cache_get(tok) if tok else None
+                pkg = str(body.get("package", "") or (cached or {}).get("package", "")).strip()
+                src = str(body.get("source", "") or (cached or {}).get("source", "") or "auto").strip()
+                ver = str(body.get("version", "") or (cached or {}).get("version", "")).strip()
+                name = str(body.get("name", "") or (cached or {}).get("name", "") or pkg).strip()
+                icon = str(body.get("icon", "") or (cached or {}).get("icon", "")).strip()
+                size = int(body.get("size") or (cached or {}).get("size") or 0)
+                if not pkg:
+                    return self.send_json({"error": "缺少安卓包名或下载信息（搜索结果已过期请重搜）"}, 400)
+                if shutil.disk_usage(CFG["data_dir"]).free < 300 * 1024 * 1024:
+                    return self.send_json({"error": "VPS 硬盘剩余不到 300MB，先清理一下再下"}, 507)
+                with JOBS_LOCK:
+                    for j in JOBS.values():
+                        if (j.get("platform") == "android" and j["app_id"] == pkg and j.get("source") == src
+                                and j.get("version", "") == ver and j["status"] in ("queued", "running", "done")):
+                            return self.send_json({"job": j["id"], "existing": True})
+                job = new_android_job(pkg, src, ver, name, icon, size, cached=cached)
                 return self.send_json({"job": job["id"]})
             m = re.fullmatch(r"/api/jobs/([0-9a-f]{16})/delete", path)
             if m:
@@ -2047,18 +3483,19 @@ IPAWEB_SERVER_PY_EOF
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
-<title>IPA 下载</title>
+<title>IPA / APK 下载</title>
 <style>
 :root {
   --bg: #f5f6f8; --card: #ffffff; --text: #1d1d1f; --muted: #6e6e73; --line: #e3e4e8;
   --accent: #0a66e8; --accent-text: #ffffff; --ok: #1f9d55; --err: #d93025; --warn: #b26a00;
   --bar: #e8ecf3; --shadow: 0 1px 2px rgba(0,0,0,.05), 0 4px 16px rgba(0,0,0,.04);
+  --android: #1f9d55;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #111214; --card: #1c1d20; --text: #f2f2f4; --muted: #a0a0a8; --line: #2c2d32;
     --accent: #4b8dff; --accent-text: #0b0c0e; --ok: #3ccf7b; --err: #ff6b5e; --warn: #f0b04a;
-    --bar: #2a2c31; --shadow: none;
+    --bar: #2a2c31; --shadow: none; --android: #3ccf7b;
   }
 }
 * { box-sizing: border-box; }
@@ -2068,10 +3505,18 @@ body {
   font: 15px/1.5 -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", sans-serif;
 }
 .wrap { max-width: 960px; margin: 0 auto; padding: 20px 16px 60px; }
-header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
+header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
 header h1 { font-size: 20px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+.tabs { display: inline-flex; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 3px; gap: 3px; }
+.tabs button { border: 0; background: none; padding: 5px 12px; border-radius: 7px; font-size: 14px; color: var(--muted); font-weight: 500; }
+.tabs button.on { background: var(--accent); color: var(--accent-text); font-weight: 600; }
+.tabs button.on.android { background: var(--android); color: #fff; }
 .chip { font-size: 13px; padding: 3px 10px; border-radius: 99px; background: var(--card); border: 1px solid var(--line); color: var(--muted); }
 .chip.ok { color: var(--ok); } .chip.err { color: var(--err); }
+.badge { display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 5px; border: 1px solid var(--line); color: var(--muted); vertical-align: middle; margin-left: 5px; font-weight: 500; }
+.badge.ios { color: var(--accent); border-color: var(--accent); }
+.badge.apk { color: var(--android); border-color: var(--android); }
+.badge.xapk { color: var(--warn); border-color: var(--warn); }
 .spacer { flex: 1; }
 button, .btn {
   font: inherit; border: 1px solid var(--line); background: var(--card); color: var(--text);
@@ -2082,17 +3527,19 @@ button.primary, .btn.primary { background: var(--accent); color: var(--accent-te
 button:disabled { opacity: .5; cursor: default; }
 button.small { padding: 4px 10px; font-size: 13px; }
 button.link { border: 0; background: none; color: var(--muted); padding: 4px 6px; }
-input {
+input, select {
   font: inherit; color: var(--text); background: var(--card); border: 1px solid var(--line);
-  border-radius: 10px; padding: 10px 12px; width: 100%; min-width: 0;
+  border-radius: 10px; padding: 10px 12px; min-width: 0;
 }
-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
+input { width: 100%; }
+select { flex: none; max-width: 210px; cursor: pointer; }
+input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
 .search { display: flex; gap: 8px; margin-bottom: 8px; }
 .hint { font-size: 13px; color: var(--muted); margin: 0 0 18px; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow); }
 .results { display: grid; gap: 10px; }
 .app { display: flex; gap: 12px; align-items: center; padding: 12px; }
-.app img { width: 56px; height: 56px; border-radius: 13px; flex: none; background: var(--bar); }
+.app img { width: 56px; height: 56px; border-radius: 13px; flex: none; background: var(--bar); object-fit: cover; }
 .app .meta { flex: 1; min-width: 0; }
 .app .name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .app .sub { font-size: 13px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -2100,7 +3547,7 @@ input:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-col
 h2 { font-size: 15px; margin: 26px 0 10px; color: var(--muted); font-weight: 600; }
 .job { padding: 12px; display: flex; gap: 12px; align-items: center; }
 .job + .job { border-top: 1px solid var(--line); }
-.job img { width: 40px; height: 40px; border-radius: 9px; flex: none; background: var(--bar); }
+.job img { width: 40px; height: 40px; border-radius: 9px; flex: none; background: var(--bar); object-fit: cover; }
 .job .meta { flex: 1; min-width: 0; }
 .bar { height: 6px; background: var(--bar); border-radius: 9px; overflow: hidden; margin-top: 6px; }
 .bar i { display: block; height: 100%; background: var(--accent); width: 0; transition: width .6s; }
@@ -2112,14 +3559,16 @@ h2 { font-size: 15px; margin: 26px 0 10px; color: var(--muted); font-weight: 600
 .msg { font-size: 14px; color: var(--err); min-height: 1.5em; }
 .banner { padding: 10px 14px; border-radius: 10px; margin-bottom: 14px; font-size: 14px; border: 1px solid var(--line); background: var(--card); }
 .banner.err { color: var(--err); }
-dialog { border: 1px solid var(--line); border-radius: 14px; background: var(--card); color: var(--text); padding: 0; width: min(520px, calc(100vw - 32px)); }
+dialog { border: 1px solid var(--line); border-radius: 14px; background: var(--card); color: var(--text); padding: 0; width: min(560px, calc(100vw - 32px)); }
 dialog::backdrop { background: rgba(0,0,0,.35); }
 .dlg-head { display: flex; align-items: center; padding: 14px 16px; border-bottom: 1px solid var(--line); font-weight: 600; }
 .dlg-body { padding: 8px 16px 16px; max-height: 60vh; overflow: auto; }
 .ver { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 14px; }
 .ver code { font-size: 13px; color: var(--muted); }
-.ver .v { flex: 1; min-width: 0; }
+.ver .v { flex: 1; min-width: 0; word-break: break-all; }
 @media (max-width: 560px) {
+  .search { flex-wrap: wrap; }
+  select { max-width: none; width: 100%; }
   .app { flex-wrap: wrap; }
   .app .acts { width: 100%; }
   .app .acts button { flex: 1; }
@@ -2141,6 +3590,7 @@ const root = $("#root");
 const verDlg = $("#verDlg");
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const mb = n => n ? (n / 1048576 >= 1024 ? (n / 1073741824).toFixed(2) + " GB" : (n / 1048576).toFixed(1) + " MB") : "";
+const FALLBACK_ICON = "data:image/svg+xml," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#d8dde6"/><path d="M20 26h24v18a4 4 0 0 1-4 4H24a4 4 0 0 1-4-4V26zm6-6a6 6 0 0 1 12 0" fill="none" stroke="#6e6e73" stroke-width="3" stroke-linecap="round"/></svg>');
 
 // 这台浏览器点过「下载」的任务：下好后自动保存到电脑，只自动一次。
 const store = {
@@ -2148,6 +3598,10 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} },
 };
 let mine = store.get("ipaweb.mine", {});
+let platformMode = store.get("ipaweb.platform", "ios");
+let apkSource = store.get("ipaweb.apk_source", "auto");
+let lastStatus = null;
+let androidResultsMap = {};
 
 async function api(path, opt = {}) {
   const r = await fetch(path, {
@@ -2168,7 +3622,7 @@ function showLogin() {
   stopPoll();
   root.innerHTML = `
     <div class="card login">
-      <h1>IPA 下载</h1>
+      <h1>IPA / APK 下载</h1>
       <form id="lf">
         <input type="password" id="pw" placeholder="网页密码" autocomplete="current-password" autofocus>
         <button class="primary" type="submit">进入</button>
@@ -2192,22 +3646,34 @@ const stopPoll = () => { clearTimeout(pollTimer); pollTimer = null; clearInterva
 function showMain() {
   root.innerHTML = `
     <header>
-      <h1>IPA 下载</h1>
-      <span class="chip" id="acct">检查 Apple ID…</span>
+      <h1>应用下载</h1>
+      <div class="tabs">
+        <button id="tabIos" type="button">iOS (IPA)</button>
+        <button id="tabAndroid" type="button">Android (APK)</button>
+      </div>
+      <span class="chip" id="acct">加载状态…</span>
       <span class="spacer"></span>
       <button class="link" id="logout">退出</button>
     </header>
     <div id="banner"></div>
     <form class="search" id="sf">
-      <input id="q" placeholder="输入 App 名字，或粘贴 App Store 链接 / Bundle ID" autocomplete="off" autofocus>
+      <select id="srcSel" style="display:none"></select>
+      <input id="q" autocomplete="off" autofocus>
       <button class="primary" type="submit">搜索</button>
     </form>
-    <p class="hint" id="hint">下好的 ipa 会自动保存到你现在用的这台电脑。ipa 带苹果加密，只能装到登录同一个 Apple ID 的设备上。</p>
+    <p class="hint" id="hint"></p>
     <div class="results" id="results"></div>
     <h2>下载任务</h2>
     <div class="card" id="jobs"><div class="empty">还没有任务</div></div>`;
   $("#logout").onclick = async () => { await api("/api/logout", {body: {}}).catch(() => {}); showLogin(); };
   $("#sf").onsubmit = e => { e.preventDefault(); doSearch(); };
+  $("#tabIos").onclick = () => switchPlatform("ios");
+  $("#tabAndroid").onclick = () => switchPlatform("android");
+  $("#srcSel").onchange = () => {
+    apkSource = $("#srcSel").value;
+    store.set("ipaweb.apk_source", apkSource);
+  };
+  applyPlatformUI();
   loadStatus();
   pollJobs();
   // 在 VPS 上用 qiequ 切区后，这里过一会儿自己更新。
@@ -2215,21 +3681,66 @@ function showMain() {
   statusTimer = setInterval(() => { if ($("#acct")) loadStatus(); }, 15000);
 }
 
+function switchPlatform(mode) {
+  if (platformMode === mode) return;
+  platformMode = mode;
+  store.set("ipaweb.platform", mode);
+  if ($("#results")) $("#results").innerHTML = "";
+  applyPlatformUI();
+  renderStatus();
+  if ($("#q")) $("#q").focus();
+}
+
+function applyPlatformUI() {
+  const isAnd = platformMode === "android";
+  const tIos = $("#tabIos"), tAnd = $("#tabAndroid"), srcSel = $("#srcSel"), q = $("#q");
+  if (tIos) tIos.className = isAnd ? "" : "on";
+  if (tAnd) tAnd.className = isAnd ? "on android" : "";
+  if (srcSel) srcSel.style.display = isAnd ? "" : "none";
+  if (q) {
+    q.placeholder = isAnd
+      ? "输入安卓 App 名字、包名（如 com.tencent.mm）、商店链接、GitHub 仓库或 .apk/.xapk 直链"
+      : "输入 App 名字，或粘贴 App Store 链接 / Bundle ID";
+  }
+}
+
+function renderStatus() {
+  const s = lastStatus;
+  if (!s || !$("#acct")) return;
+  const el = $("#acct"), cc = (s.country || "cn").toUpperCase();
+  const srcSel = $("#srcSel");
+  if (srcSel && !srcSel.options.length && Array.isArray(s.android_sources)) {
+    srcSel.innerHTML = s.android_sources.map(x =>
+      `<option value="${esc(x.id)}"${x.id === apkSource ? " selected" : ""}>${esc(x.name)}</option>`
+    ).join("");
+  }
+  if (platformMode === "android") {
+    el.className = "chip ok";
+    el.textContent = `安卓免登录 · 多源聚合${s.has_apkeep ? " + apkeep" : ""}`;
+    $("#banner").innerHTML = "";
+    $("#hint").textContent = `支持 APK / XAPK / APKS，免登录直接下载 · 支持关键词、包名、Google Play / APKPure / 华为 / 应用宝 / F-Droid 链接、GitHub 仓库或安装包直链 · 文件在 VPS 保留 ${s.retention_minutes} 分钟 · 同时下载 ${s.max_concurrent} 个 · VPS 剩余空间 ${mb(s.disk_free)}。`;
+    return;
+  }
+  const a = s.account || {};
+  if (a.logged_in) {
+    el.className = "chip ok"; el.textContent = `${cc} 区 · ${a.email || a.name || "已登录"}`;
+    $("#banner").innerHTML = "";
+  } else {
+    el.className = "chip err"; el.textContent = `${cc} 区 · 未登录`;
+    $("#banner").innerHTML = `<div class="banner err">${esc(a.error || "VPS 上还没登录 Apple ID")}（可切换到上方 Android 直接下载 APK）</div>`;
+  }
+  const n = (s.accounts || []).length;
+  $("#hint").textContent = `App Store 地区：${cc}${n > 1 ? `（存了 ${n} 个账号：${s.accounts.map(x => x.country.toUpperCase()).join("、")}，在 VPS 终端运行 qiequ 切区）` : "（在 VPS 终端运行 qiequ 切区）"} · 下好的文件在 VPS 上保留 ${s.retention_minutes} 分钟 · 同时下载 ${s.max_concurrent} 个 · VPS 剩余空间 ${mb(s.disk_free)}。ipa 带苹果加密，只能装到登录同一个 Apple ID 的设备上。`;
+}
+
 async function loadStatus() {
   try {
     const s = await api("/api/status");
-    const a = s.account, el = $("#acct"), cc = s.country.toUpperCase();
-    if (a.logged_in) {
-      el.className = "chip ok"; el.textContent = `${cc} 区 · ${a.email || a.name || "已登录"}`;
-      $("#banner").innerHTML = "";
-    } else {
-      el.className = "chip err"; el.textContent = `${cc} 区 · 未登录`;
-      $("#banner").innerHTML = `<div class="banner err">${esc(a.error || "VPS 上还没登录 Apple ID")}</div>`;
-    }
-    const n = (s.accounts || []).length;
-    $("#hint").textContent = `App Store 地区：${cc}${n > 1 ? `（存了 ${n} 个账号：${s.accounts.map(x => x.country.toUpperCase()).join("、")}，在 VPS 终端运行 qiequ 切区）` : "（在 VPS 终端运行 qiequ 切区）"} · 下好的文件在 VPS 上保留 ${s.retention_minutes} 分钟 · 同时下载 ${s.max_concurrent} 个 · VPS 剩余空间 ${mb(s.disk_free)}。ipa 带苹果加密，只能装到登录同一个 Apple ID 的设备上。`;
-    // 切区以后，旧地区的搜索结果可能下不了，清掉。
-    if (lastCountry && lastCountry !== cc && $("#results")) {
+    const cc = (s.country || "cn").toUpperCase();
+    lastStatus = s;
+    renderStatus();
+    // 切区以后，旧地区的 iOS 搜索结果可能下不了，清掉。
+    if (platformMode === "ios" && lastCountry && lastCountry !== cc && $("#results")) {
       $("#results").innerHTML = `<div class="card empty">已切到 ${cc} 区，重新搜索一下</div>`;
     }
     lastCountry = cc;
@@ -2240,15 +3751,51 @@ async function doSearch() {
   const q = $("#q").value.trim();
   if (!q) return;
   const box = $("#results");
+  if (platformMode === "android") {
+    box.innerHTML = `<div class="card empty">正在从多个安卓源搜索…</div>`;
+    try {
+      const {results} = await api(`/api/android/search?q=${encodeURIComponent(q)}&source=${encodeURIComponent(apkSource)}`);
+      if (!results.length) {
+        box.innerHTML = `<div class="card empty">没搜到。可以换个关键词、切换上面的下载源，或直接输入包名（如 org.telegram.messenger）、GitHub 仓库（owner/repo）或 .apk 直链。</div>`;
+        return;
+      }
+      androidResultsMap = {};
+      results.forEach(a => { androidResultsMap[a.token] = a; });
+      box.innerHTML = results.map(a => {
+        const pt = (a.pkg_type || "APK").toUpperCase();
+        const bcls = pt === "APK" ? "apk" : "xapk";
+        const metaLine = [a.version ? "v" + a.version : "", mb(a.size), a.source_name || a.source].filter(Boolean).join(" · ");
+        return `
+          <div class="card app">
+            <img src="${esc(a.icon || FALLBACK_ICON)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.src='${FALLBACK_ICON}'">
+            <div class="meta">
+              <div class="name" title="${esc(a.name)}">${esc(a.name)}<span class="badge ${bcls}">${esc(pt)}</span></div>
+              <div class="sub">${esc(a.seller)} · ${esc(a.package)}</div>
+              <div class="sub">${esc(metaLine)}</div>
+            </div>
+            <div class="acts">
+              ${a.source !== "direct" ? `<button class="small" data-aver="${esc(a.token)}">历史版本</button>` : ""}
+              <button class="small primary" data-adl="${esc(a.token)}">下载 ${esc(pt)}</button>
+            </div>
+          </div>`;
+      }).join("");
+      box.querySelectorAll("[data-adl]").forEach(b => b.onclick = () => startAndroidDownload(androidResultsMap[b.dataset.adl], b));
+      box.querySelectorAll("[data-aver]").forEach(b => b.onclick = () => showAndroidVersions(androidResultsMap[b.dataset.aver]));
+    } catch (e) {
+      box.innerHTML = `<div class="card empty">${esc(e.message)}</div>`;
+    }
+    return;
+  }
+
   box.innerHTML = `<div class="card empty">搜索中…</div>`;
   try {
     const {results} = await api("/api/search?q=" + encodeURIComponent(q));
     if (!results.length) { box.innerHTML = `<div class="card empty">没搜到。换个关键词，或者直接粘贴 App Store 链接试试。</div>`; return; }
     box.innerHTML = results.map(a => `
       <div class="card app">
-        <img src="${esc(a.icon)}" alt="" loading="lazy" referrerpolicy="no-referrer">
+        <img src="${esc(a.icon || FALLBACK_ICON)}" alt="" loading="lazy" referrerpolicy="no-referrer">
         <div class="meta">
-          <div class="name" title="${esc(a.name)}">${esc(a.name)}</div>
+          <div class="name" title="${esc(a.name)}">${esc(a.name)}<span class="badge ios">IPA</span></div>
           <div class="sub">${esc(a.seller)} · ${esc(a.bundle)}</div>
           <div class="sub">v${esc(a.version)} · ${mb(a.size)} · ${esc(a.price)}${a.minos ? " · iOS " + esc(a.minos) + "+" : ""}</div>
         </div>
@@ -2268,6 +3815,29 @@ async function startDownload(id, extVer, btn) {
   if (btn) btn.disabled = true;
   try {
     const r = await api("/api/download", {body: {id, ext_ver: extVer}});
+    mine[r.job] = "pending"; store.set("ipaweb.mine", mine);
+    if (btn) btn.textContent = r.existing ? "已在任务里" : "已加入";
+    pollJobs();
+    $("#jobs").scrollIntoView({behavior: "smooth", block: "nearest"});
+  } catch (e) {
+    alert(e.message);
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function startAndroidDownload(item, btn) {
+  if (!item) return;
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api("/api/android/download", {body: {
+      token: item.token,
+      package: item.package,
+      source: item.source,
+      version: item.version || "",
+      name: item.name || item.package,
+      icon: item.icon || "",
+      size: item.size || 0,
+    }});
     mine[r.job] = "pending"; store.set("ipaweb.mine", mine);
     if (btn) btn.textContent = r.existing ? "已在任务里" : "已加入";
     pollJobs();
@@ -2316,14 +3886,21 @@ async function pollJobs() {
 
 function jobRow(j) {
   let line = "", bar = "", acts = "";
-  const name = esc(j.name) + (j.version ? ` <span class="sub">v${esc(j.version)}</span>` : "") +
-    (j.country ? ` <span class="sub">· ${esc(j.country.toUpperCase())} 区 ${esc(j.account || "")}</span>` : "");
+  const isAnd = j.platform === "android";
+  const pt = (j.pkg_type || (isAnd ? "APK" : "IPA")).toUpperCase();
+  const bcls = isAnd ? (pt === "APK" ? "apk" : "xapk") : "ios";
+  const tag = `<span class="badge ${bcls}">${esc(pt)}</span>`;
+  const subTag = isAnd
+    ? (j.source_name ? ` <span class="sub">· ${esc(j.source_name)}</span>` : "")
+    : (j.country ? ` <span class="sub">· ${esc(j.country.toUpperCase())} 区 ${esc(j.account || "")}</span>` : "");
+  const name = esc(j.name) + tag + (j.version ? ` <span class="sub">v${esc(j.version)}</span>` : "") + subTag;
   if (j.status === "queued") {
     line = `<span class="st-queued">排队中（第 ${j.queue_pos} 个）</span>`;
     acts = `<button class="small" data-del="${j.id}">取消</button>`;
   } else if (j.status === "running") {
     const pct = j.size ? Math.min(99, Math.floor(j.bytes * 100 / j.size)) : 0;
-    line = `VPS 正在从 App Store 下载… ${mb(j.bytes) || "准备中"}${j.size ? " / 约 " + mb(j.size) : ""}`;
+    const fromTxt = isAnd ? (j.source_name || "安卓源") : "App Store";
+    line = `VPS 正在从 ${esc(fromTxt)} 下载… ${mb(j.bytes) || "准备中"}${j.size ? " / 约 " + mb(j.size) : ""}`;
     bar = `<div class="bar"><i style="width:${j.size ? pct : 8}%"></i></div>`;
   } else if (j.status === "done") {
     const left = Math.max(0, Math.round((j.expires * 1000 - Date.now()) / 60000));
@@ -2334,13 +3911,13 @@ function jobRow(j) {
     acts = `<button class="small" data-del="${j.id}">移除</button>`;
   }
   return `<div class="job">
-    <img src="${esc(j.icon)}" alt="" referrerpolicy="no-referrer">
+    <img src="${esc(j.icon || FALLBACK_ICON)}" alt="" referrerpolicy="no-referrer" onerror="this.src='${FALLBACK_ICON}'">
     <div class="meta"><div class="name">${name}</div><div class="sub">${line}</div>${bar}</div>
     <div class="acts">${acts}</div>
   </div>`;
 }
 
-// ---------------- 历史版本 ----------------
+// ---------------- 历史版本（iOS） ----------------
 async function showVersions(id, name) {
   $("#verTitle").textContent = name + " · 历史版本";
   const body = $("#verBody");
@@ -2366,6 +3943,50 @@ async function showVersions(id, name) {
       } catch (e) { out.textContent = e.message; b.disabled = false; }
     });
     body.querySelectorAll("[data-vdl]").forEach(b => b.onclick = () => { startDownload(id, b.dataset.vdl, b); });
+  } catch (e) {
+    body.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+  }
+}
+
+// ---------------- 历史版本（Android） ----------------
+async function showAndroidVersions(app) {
+  if (!app) return;
+  $("#verTitle").textContent = app.name + " · 安卓历史版本";
+  const body = $("#verBody");
+  body.innerHTML = `<div class="empty">正在查询历史版本…</div>`;
+  verDlg.showModal();
+  try {
+    const q = `pkg=${encodeURIComponent(app.package)}&source=${encodeURIComponent(app.source)}&token=${encodeURIComponent(app.token)}`;
+    const {versions} = await api("/api/android/versions?" + q);
+    if (!versions.length) {
+      body.innerHTML = `<div class="empty">该应用暂未查到历史版本（可直接下载最新版）。</div>`;
+      return;
+    }
+    const vMap = {};
+    versions.forEach(v => { vMap[v.token] = v; });
+    body.innerHTML = versions.map(v => {
+      const sub = [v.date, mb(v.size), v.arch, v.pkg_type, v.source_name].filter(Boolean).join(" · ");
+      return `
+        <div class="ver">
+          <div class="v">
+            <div><strong>v${esc(v.version)}</strong></div>
+            <div class="sub" style="font-size:12px;color:var(--muted)">${esc(sub)}</div>
+          </div>
+          <button class="small primary" data-avdl="${esc(v.token)}">下载</button>
+        </div>`;
+    }).join("");
+    body.querySelectorAll("[data-avdl]").forEach(b => b.onclick = () => {
+      const v = vMap[b.dataset.avdl];
+      startAndroidDownload({
+        token: v.token,
+        package: app.package,
+        source: v.source || app.source,
+        version: v.version,
+        name: app.name,
+        icon: app.icon,
+        size: v.size || app.size,
+      }, b);
+    });
   } catch (e) {
     body.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
   }
@@ -3100,6 +4721,12 @@ show_status() {
   else
     printf 'ipatool：%s（自动更新 %s）　脚本：%s\n' "$(ipatool_version)" "$au_st" "$VERSION"
   fi
+  ak_v=$(apkeep_version)
+  if [ -n "$ak_v" ]; then
+    printf '安卓下载：内置 8 源聚合引擎 + apkeep %s（免登录）\n' "$ak_v"
+  else
+    printf '安卓下载：内置 8 源聚合引擎（免登录）\n'
+  fi
   printf '程序目录：%s　日志：%s\n' "$BASE" "$LOG"
   if [ "$(cfg_get nat)" = 1 ]; then
     printf '%s\n' "${C_YELLOW}这是 NAT 小鸡：外网端口 $(cfg_get public_port) 要在商家面板里映射到内网端口 $(cfg_get listen_port)。${C_NC}"
@@ -3306,7 +4933,7 @@ write_config() {
   cfg_set listen_host "$host" listen_port "$Q_PORT" public_port "${Q_PUBLIC_PORT:-$Q_PORT}" \
     https_domain "$Q_DOMAIN" trust_proxy "$proxy" country "$Q_COUNTRY" \
     retention_minutes "$Q_RETENTION" max_concurrent "$Q_CONCURRENT" \
-    ipatool_bin "$BASE/bin/ipatool" home_dir "$BASE/home" data_dir "$BASE/data" \
+    ipatool_bin "$BASE/bin/ipatool" apkeep_bin "$BASE/bin/apkeep" home_dir "$BASE/home" data_dir "$BASE/data" \
     public_ipv4 "$PUB4" public_ipv6 "$PUB6" nat "$NAT" script_version "$VERSION"
   if low_mem; then
     cfg_set low_memory true
@@ -3366,7 +4993,7 @@ fresh_install() {
 
   if [ -n "$(cfg_get active)" ] && acct_home_ok "$(cfg_get home_dir)"; then
     say_ok "保存的 Apple ID 账号都还在，正在用：$(upper "$(cfg_get country)")  $(cfg_get apple_id)"
-  elif can_ask && ask_yn "现在登录 Apple ID 吗？（不登录就下不了，以后也可以运行 qiequ 添加）" y; then
+  elif can_ask && ask_yn "现在登录 Apple ID 吗？（安卓 APK 免登录直接能下；苹果 IPA 需要登录，以后也能运行 qiequ 添加）" y; then
     acct_add "$Q_COUNTRY" || say_warn "Apple ID 还没登录，之后运行 qiequ 选 a 添加"
   fi
 
@@ -3525,6 +5152,7 @@ apply_update() {
   else
     cfg_set low_memory false ipatool_dl_bin ""
   fi
+  if [ -x "$BASE/bin/apkeep" ]; then cfg_set apkeep_bin "$BASE/bin/apkeep"; fi
   cfg_set script_version "$VERSION"
   if restart_all; then say_ok "更新好了（脚本 $VERSION，ipatool $(ipatool_version)）"; else say_err "更新后网页服务没起来，运行 ipa-web --log 看看"; fi
 }
