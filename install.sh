@@ -45,7 +45,7 @@
 #   HTTPS          加密的网址（https://），需要一个解析到 VPS 的域名
 #======================================================================
 
-VERSION=1.4.0
+VERSION=1.4.1
 # ipaweb-onekey-begin
 
 REPO=imthnio/vps-ipatool
@@ -1176,7 +1176,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 HERE = os.path.dirname(os.path.abspath(__file__))
 BASE_DIR = os.path.dirname(HERE)  # /opt/ipa-web
 TMP_ROOT = os.path.join(BASE_DIR, "tmp")
@@ -1893,12 +1893,77 @@ def apkpure_versions(pkg):
     return out
 
 
-# ---- 2. Uptodown 移动端 eAPI ----
+def apkpure_cms_download_url(pkg, version=""):
+    """调用 APKPure 移动端 CMS 版本接口（与 EFF apkeep 同源），获取直连 CDN 链接。"""
+    url = "https://api.pureapk.com/m/v3/cms/app_version?hl=en-US&package_name=" + urllib.parse.quote(pkg, safe="")
+    hdrs = {
+        "User-Agent": APK_UA_DALVIK,
+        "x-cv": "3172501",
+        "x-sv": "29",
+        "x-abis": "arm64-v8a,armeabi-v7a,armeabi,x86,x86_64",
+        "x-gp": "1",
+    }
+    _, _, raw = _http_read(url, headers=hdrs, timeout=10)
+    text = raw.decode("latin-1", "replace")
+    pat = r"(X?APKJ)..(https?://[-a-zA-Z0-9@:%._+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b[-a-zA-Z0-9()@:%_+.~#?&//=]*)"
+    if version:
+        m = re.search(r"[^0-9]" + re.escape(version) + r":.+?" + pat, text, re.S)
+    else:
+        m = re.search(pat, text)
+    if not m:
+        return None, None
+    ext = ".xapk" if m.group(1) == "XAPKJ" else ".apk"
+    return m.group(2), ext
+
+
+# ---- 2. Uptodown 移动端 eAPI（支持 Obtainium 最新 Bearer Token + 旧版 APIKEY 双模式）----
 _UPTODOWN_BASE = "https://www.uptodown.app/eapi"
 _UPTODOWN_SECRET = "$(=a%\u00b7!45J&S"
+_UPTODOWN_HMAC_KEY = b"MDGMXUMdvHJBG/vjdFgmqX6LUdy7ecfwvYNd0gyfOCs="
+_UPTODOWN_SESSION = {"token": "", "exp": 0}
+_UPTODOWN_LOCK = threading.Lock()
 
 
-def _uptodown_headers():
+def _uptodown_bearer_token(force=False):
+    with _UPTODOWN_LOCK:
+        now = int(time.time())
+        if not force and _UPTODOWN_SESSION["token"] and now < _UPTODOWN_SESSION["exp"] - 60:
+            return _UPTODOWN_SESSION["token"]
+        ident = secrets.token_hex(8)
+        ts = str(now)
+        sig = hmac.new(_UPTODOWN_HMAC_KEY, ts.encode("utf-8"), hashlib.sha256).hexdigest()
+        body = urllib.parse.urlencode({
+            "identifier": ident, "id_plataforma": "13", "lang": "en",
+            "unixtime": ts, "hmac": sig,
+        })
+        hdrs = {
+            "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 16; Pixel 8 Pro Build/BP4A.260205.001)",
+            "Identificador": "Uptodown_Android",
+            "Identificador-Version": "739",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        try:
+            d = _http_json("%s/auth/token?identifier=%s" % (_UPTODOWN_BASE, ident),
+                           headers=hdrs, data=body, timeout=8)
+            tok = d.get("token") or ""
+            if tok and len(tok.split(".")) == 3:
+                _UPTODOWN_SESSION.update(token=tok, exp=now + 3600)
+                return tok
+        except Exception:
+            pass
+        return ""
+
+
+def _uptodown_headers(use_bearer=True):
+    if use_bearer:
+        tok = _uptodown_bearer_token()
+        if tok:
+            return {
+                "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 16; Pixel 8 Pro Build/BP4A.260205.001)",
+                "Identificador": "Uptodown_Android",
+                "Identificador-Version": "739",
+                "Authorization": "Bearer " + tok,
+            }
     hour_epoch = (int(time.time()) // 3600) * 3600
     apikey = hashlib.sha256((_UPTODOWN_SECRET + str(hour_epoch)).encode("utf-8")).hexdigest()
     return {
@@ -2701,50 +2766,98 @@ def android_versions(pkg, source, extra=None):
     return out
 
 
+def _download_apk_curl(url, dest_dir, base_name, version, headers=None, expected_ext=".apk"):
+    """当 Python urllib 被 Cloudflare 返回 text/html 或 403 时，尝试用系统 curl 下载。"""
+    curl_bin = shutil.which("curl")
+    if not curl_bin:
+        raise RuntimeError("系统未安装 curl")
+    ext = _guess_pkg_ext(url, None, expected_ext)
+    fname = safe_filename(base_name, version, ext=ext)
+    part = os.path.join(dest_dir, fname + ".curl.part")
+    final = os.path.join(dest_dir, fname)
+    cmd = [curl_bin, "-fsSL", "--connect-timeout", "15", "--max-time", "7200", "-o", part]
+    hdrs = {"User-Agent": APK_UA_BROWSER}
+    if headers:
+        hdrs.update(headers)
+    for k, v in hdrs.items():
+        cmd += ["-H", "%s: %s" % (k, v)]
+    cmd.append(url)
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=7200)
+        if p.returncode != 0 or not os.path.isfile(part):
+            raise RuntimeError("curl 失败（rc=%d）" % p.returncode)
+        size = os.path.getsize(part)
+        if size < 4096:
+            raise RuntimeError("curl 下载文件过小（%d 字节）" % size)
+        with open(part, "rb") as f:
+            magic = f.read(4)
+        if not magic.startswith(b"PK"):
+            raise RuntimeError("curl 返回的也不是有效安装包（可能被源站拦截）")
+        os.replace(part, final)
+        return final, fname, size
+    except Exception:
+        if os.path.exists(part):
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+        raise
+
+
 def _download_apk_stream(url, dest_dir, base_name, version, headers=None, expected_ext=".apk", timeout=7200):
     hdrs = {"User-Agent": APK_UA_BROWSER}
     if headers:
         hdrs.update(headers)
     req = urllib.request.Request(url, headers=hdrs)
-    with urllib.request.urlopen(req, timeout=15) as r:
-        ext = _guess_pkg_ext(r.geturl() or url, r.headers, expected_ext)
-        total = int(r.headers.get("Content-Length") or 0)
-        fname = safe_filename(base_name, version, ext=ext)
-        part = os.path.join(dest_dir, fname + ".part")
-        final = os.path.join(dest_dir, fname)
-        got = 0
-        first_chunk = b""
-        with open(part, "wb") as f:
-            while True:
-                chunk = r.read(256 * 1024)
-                if not chunk:
-                    break
-                if not first_chunk:
-                    first_chunk = chunk[:16]
-                    # APK / XAPK / APKS / AAB 都是 ZIP 格式（PK\x03\x04）
-                    if not first_chunk.startswith(b"PK"):
-                        f.close()
-                        os.remove(part)
-                        ct = r.headers.get("Content-Type", "")
-                        raise RuntimeError("返回的不是有效安装包（Content-Type: %s），可能被源站拦截" % ct)
-                f.write(chunk)
-                got += len(chunk)
-        if total > 0 and got < total:
-            os.remove(part)
-            raise RuntimeError("文件下载不完整（%d / %d 字节）" % (got, total))
-        if got < 4096:
-            os.remove(part)
-            raise RuntimeError("下载到的文件过小（%d 字节），不是有效安装包" % got)
-        os.replace(part, final)
-        return final, fname, got
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            ext = _guess_pkg_ext(r.geturl() or url, r.headers, expected_ext)
+            total = int(r.headers.get("Content-Length") or 0)
+            fname = safe_filename(base_name, version, ext=ext)
+            part = os.path.join(dest_dir, fname + ".part")
+            final = os.path.join(dest_dir, fname)
+            got = 0
+            first_chunk = b""
+            with open(part, "wb") as f:
+                while True:
+                    chunk = r.read(256 * 1024)
+                    if not chunk:
+                        break
+                    if not first_chunk:
+                        first_chunk = chunk[:16]
+                        # APK / XAPK / APKS / AAB 都是 ZIP 格式（PK\x03\x04）
+                        if not first_chunk.startswith(b"PK"):
+                            f.close()
+                            os.remove(part)
+                            ct = r.headers.get("Content-Type", "")
+                            raise RuntimeError("返回的不是有效安装包（Content-Type: %s），可能被源站拦截" % ct)
+                    f.write(chunk)
+                    got += len(chunk)
+            if total > 0 and got < total:
+                os.remove(part)
+                raise RuntimeError("文件下载不完整（%d / %d 字节）" % (got, total))
+            if got < 4096:
+                os.remove(part)
+                raise RuntimeError("下载到的文件过小（%d 字节），不是有效安装包" % got)
+            os.replace(part, final)
+            return final, fname, got
+    except Exception as e:
+        msg = str(e)
+        # Cloudflare 常拦截 Python urllib 的 TLS 指纹（返回 403 或 text/html），自动换 curl 再试一次
+        if "text/html" in msg or "403" in msg or "Forbidden" in msg:
+            try:
+                return _download_apk_curl(url, dest_dir, base_name, version, headers=headers, expected_ext=expected_ext)
+            except Exception:
+                pass
+        raise
 
 
-def _apkeep_fallback(pkg, dest_dir, version=""):
+def _apkeep_fallback(pkg, dest_dir, version="", pinned_ver=False):
     """如果系统装了 EFF apkeep，作为 APKPure / F-Droid 的额外下载兜底。"""
     ak = CFG.get("apkeep_bin") or os.path.join(BASE_DIR, "bin", "apkeep")
     if not (ak and os.path.isfile(ak) and os.access(ak, os.X_OK)):
         return None
-    app_arg = "%s@%s" % (pkg, version) if version else pkg
+    app_arg = "%s@%s" % (pkg, version) if (pinned_ver and version) else pkg
     attempts = [
         [ak, "-a", app_arg, "-d", "apk-pure", "-o", "acknowledge_dangers=true", dest_dir],
         [ak, "-a", app_arg, "-d", "f-droid", dest_dir],
@@ -2752,15 +2865,19 @@ def _apkeep_fallback(pkg, dest_dir, version=""):
     for cmd in attempts:
         try:
             p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=1800)
-            if p.returncode == 0:
-                for root, _, files in os.walk(dest_dir):
-                    for fn in files:
-                        if any(fn.lower().endswith(ext) for ext in APK_EXTS):
-                            full = os.path.join(root, fn)
-                            if os.path.getsize(full) > 4096:
-                                return full, fn, os.path.getsize(full)
-        except Exception:
-            pass
+            out = (p.stdout or b"").decode("utf-8", "replace").strip()
+            if out:
+                log("apkeep 输出", app_arg, out[-300:])
+            for root, _, files in os.walk(dest_dir):
+                for fn in files:
+                    if any(fn.lower().endswith(ext) for ext in APK_EXTS):
+                        full = os.path.join(root, fn)
+                        if os.path.getsize(full) > 4096:
+                            with open(full, "rb") as f:
+                                if f.read(2) == b"PK":
+                                    return full, fn, os.path.getsize(full)
+        except Exception as e:
+            log("apkeep 执行异常", app_arg, e)
     return None
 
 
@@ -2769,6 +2886,7 @@ def download_android_job(job):
     src = job.get("source", "")
     cached = job.get("apk_info") or {}
     ver = job.get("version", "")
+    pinned_ver = bool(job.get("pinned_ver"))
     name = job.get("name") or pkg
     errors = []
 
@@ -2779,6 +2897,7 @@ def download_android_job(job):
             try:
                 return _download_apk_stream(u, job["dir"], name, ver, headers=hdrs, expected_ext=ext_hint)
             except Exception as e:
+                log("安卓源下载尝试失败", label, pkg, e)
                 errors.append("%s: %s" % (label, e))
         return None
 
@@ -2790,10 +2909,31 @@ def download_android_job(job):
         if res:
             return res
 
-    # 2. 按指定源解析下载链接（例如 Uptodown 或搜索结果里不含直链的应用宝）
+    # 2. 如果主源是 APKPure 且直链失败，走 APKPure 移动端 CMS 接口（与 apkeep 同源）+ get_app_detail 重试
+    if src == "apkpure" and _is_pkg_name(pkg):
+        try:
+            cms_url, cms_ext = apkpure_cms_download_url(pkg, ver if pinned_ver else "")
+            if cms_url:
+                res = try_urls([cms_url], {"User-Agent": APK_UA_DALVIK}, cms_ext or ".apk", "APKPure CMS")
+                if res:
+                    return res
+        except Exception as e:
+            errors.append("APKPure CMS: %s" % e)
+        if not pinned_ver:
+            try:
+                d = apkpure_detail(pkg)
+                if d and d.get("dl_url") and d["dl_url"] != cached.get("dl_url"):
+                    ext_hint = "." + (d.get("pkg_type") or "apk").lower()
+                    res = try_urls([d["dl_url"]], d.get("dl_headers"), ext_hint, "APKPure 详情")
+                    if res:
+                        return res
+            except Exception as e:
+                errors.append("APKPure 详情: %s" % e)
+
+    # 3. 按指定源解析下载链接（例如 Uptodown 或搜索结果里不含直链的应用宝/华为）
     if src == "uptodown":
         try:
-            u, hdrs, ext_hint, rver = uptodown_resolve_download(pkg, cached.get("extra"), ver)
+            u, hdrs, ext_hint, rver = uptodown_resolve_download(pkg, cached.get("extra"), ver if pinned_ver else "")
             if rver and not ver:
                 ver = rver
                 job["version"] = rver
@@ -2821,13 +2961,25 @@ def download_android_job(job):
         except Exception as e:
             errors.append("华为应用市场: %s" % e)
 
-    # 3. 多源自动回退（当包名合法且不是直链/GitHub 时）
-    if _is_pkg_name(pkg) and not ver:
+    # 4. 多源自动回退（只要包名合法且不是锁定特定历史版本，就依次尝试所有其他源）
+    if _is_pkg_name(pkg) and not pinned_ver:
+        # 先试 Uptodown（海外源大库，Bearer Token 直链稳定）
+        if src != "uptodown":
+            try:
+                u, hdrs, ext_hint, rver = uptodown_resolve_download(pkg)
+                res = try_urls([u], hdrs, ext_hint, "Uptodown")
+                if res:
+                    job["source"] = "uptodown"
+                    if rver:
+                        job["version"] = rver
+                    return res
+            except Exception as e:
+                errors.append("Uptodown: %s" % e)
         fallbacks = [
+            ("aptoide", aptoide_detail),
             ("apkpure", apkpure_detail),
             ("huawei", lambda p: huawei_detail(pkg=p)),
             ("tencent", tencent_detail),
-            ("aptoide", aptoide_detail),
             ("fdroid", fdroid_detail),
         ]
         for fb_id, fb_fn in fallbacks:
@@ -2841,32 +2993,31 @@ def download_android_job(job):
                     res = try_urls(urls, d.get("dl_headers"), ext_hint, APK_SOURCE_NAMES.get(fb_id, fb_id))
                     if res:
                         job["source"] = fb_id
-                        if d.get("version") and not job.get("version"):
+                        if d.get("version"):
                             job["version"] = d["version"]
                         return res
             except Exception as e:
                 errors.append("%s: %s" % (APK_SOURCE_NAMES.get(fb_id, fb_id), e))
-        # 再试 Uptodown
-        if src != "uptodown":
+        # APKPure CMS 也作为最后在线回退
+        if src != "apkpure":
             try:
-                u, hdrs, ext_hint, rver = uptodown_resolve_download(pkg)
-                res = try_urls([u], hdrs, ext_hint, "Uptodown")
-                if res:
-                    job["source"] = "uptodown"
-                    if rver and not job.get("version"):
-                        job["version"] = rver
-                    return res
+                cms_url, cms_ext = apkpure_cms_download_url(pkg)
+                if cms_url:
+                    res = try_urls([cms_url], {"User-Agent": APK_UA_DALVIK}, cms_ext or ".apk", "APKPure CMS")
+                    if res:
+                        job["source"] = "apkpure"
+                        return res
             except Exception as e:
-                errors.append("Uptodown: %s" % e)
+                errors.append("APKPure CMS: %s" % e)
 
-    # 4. apkeep 命令行兜底
+    # 5. apkeep 命令行兜底
     if _is_pkg_name(pkg):
-        res = _apkeep_fallback(pkg, job["dir"], ver)
+        res = _apkeep_fallback(pkg, job["dir"], ver, pinned_ver=pinned_ver)
         if res:
             job["source"] = "apkeep"
             return res
 
-    raise RuntimeError("所有可用安卓源都下载失败：" + ("；".join(errors[-3:]) if errors else "未找到安装包"))
+    raise RuntimeError("所有可用安卓源都下载失败：" + ("；".join(errors[-4:]) if errors else "未找到安装包"))
 
 
 #----------------------------------------------------------------------
@@ -3017,7 +3168,7 @@ def new_job(app_id, ext_ver=""):
     return job
 
 
-def new_android_job(pkg, source="", version="", name="", icon="", size=0, cached=None):
+def new_android_job(pkg, source="", version="", name="", icon="", size=0, cached=None, pinned_ver=False):
     cached = cached or {}
     pkg = pkg or cached.get("package") or ""
     source = source or cached.get("source") or "auto"
@@ -3038,8 +3189,9 @@ def new_android_job(pkg, source="", version="", name="", icon="", size=0, cached
         "pkg_type": pkg_type,
         "app_id": pkg,
         "ext_ver": version,
-        "name": name,
         "version": version,
+        "pinned_ver": bool(pinned_ver),
+        "name": name,
         "icon": icon,
         "size": size,
         "apk_info": cached,
@@ -3271,6 +3423,7 @@ class Handler(BaseHTTPRequestHandler):
                 name = str(body.get("name", "") or (cached or {}).get("name", "") or pkg).strip()
                 icon = str(body.get("icon", "") or (cached or {}).get("icon", "")).strip()
                 size = int(body.get("size") or (cached or {}).get("size") or 0)
+                pinned_ver = bool(body.get("pinned_ver"))
                 if not pkg:
                     return self.send_json({"error": "缺少安卓包名或下载信息（搜索结果已过期请重搜）"}, 400)
                 if shutil.disk_usage(CFG["data_dir"]).free < 300 * 1024 * 1024:
@@ -3280,7 +3433,7 @@ class Handler(BaseHTTPRequestHandler):
                         if (j.get("platform") == "android" and j["app_id"] == pkg and j.get("source") == src
                                 and j.get("version", "") == ver and j["status"] in ("queued", "running", "done")):
                             return self.send_json({"job": j["id"], "existing": True})
-                job = new_android_job(pkg, src, ver, name, icon, size, cached=cached)
+                job = new_android_job(pkg, src, ver, name, icon, size, cached=cached, pinned_ver=pinned_ver)
                 return self.send_json({"job": job["id"]})
             m = re.fullmatch(r"/api/jobs/([0-9a-f]{16})/delete", path)
             if m:
@@ -3834,6 +3987,7 @@ async function startAndroidDownload(item, btn) {
       package: item.package,
       source: item.source,
       version: item.version || "",
+      pinned_ver: !!item.pinned_ver,
       name: item.name || item.package,
       icon: item.icon || "",
       size: item.size || 0,
@@ -3982,6 +4136,7 @@ async function showAndroidVersions(app) {
         package: app.package,
         source: v.source || app.source,
         version: v.version,
+        pinned_ver: true,
         name: app.name,
         icon: app.icon,
         size: v.size || app.size,
